@@ -13,8 +13,15 @@ requests==2.32.5
 # modal==0.66.0
 
 # =============================================================================
-# LOCAL INFERENCE (optional - only needed if running inference locally)
-# Uncomment the following lines to enable local CPU/GPU inference:
+# LIGHTWEIGHT LOCAL INFERENCE (recommended)
+# Fast CPU inference using MolScribe + OpenCV (no TensorFlow needed):
+# =============================================================================
+# molscribe>=1.0
+# torch>=1.11.0
+
+# =============================================================================
+# DECIMER LOCAL INFERENCE (optional - heavier, requires TensorFlow)
+# Uncomment the following lines to enable DECIMER-based local inference:
 # =============================================================================
 # decimer==2.7.0
 # decimer-segmentation==1.4.0

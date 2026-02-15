@@ -93,6 +93,7 @@ class ProcessingWorker(QThread):
     result_ready = Signal(ExtractionResult)
     processing_complete = Signal(list)  # List[ExtractionResult]
     error_occurred = Signal(str)
+    warning_occurred = Signal(str)
 
     def __init__(self, parent=None):
         """Initialize the processing worker."""
@@ -114,6 +115,9 @@ class ProcessingWorker(QThread):
         # Cloud/local inference provider
         self._inference_provider: Optional[InferenceProvider] = None
         self._inference_settings = InferenceSettings.get_instance()
+
+        # Auto page detection
+        self._auto_detect_pages: bool = True
 
         # Store extracted bio data for access after processing
         # Format: {source_file: {compound_id: BiologicalData}}
@@ -155,6 +159,17 @@ class ProcessingWorker(QThread):
         """
         self._page_filter = page_filter if page_filter else None
 
+    def set_auto_detect_pages(self, enabled: bool) -> None:
+        """Enable or disable automatic page detection before processing.
+
+        When enabled, uses PageClassifier to scan pages and skip
+        text-only pages that don't contain chemical structures.
+
+        Args:
+            enabled: True to enable auto page detection.
+        """
+        self._auto_detect_pages = enabled
+
     def request_cancel(self) -> None:
         """Request cancellation of the current processing."""
         with QMutexLocker(self._mutex):
@@ -176,8 +191,9 @@ class ProcessingWorker(QThread):
         if self._inference_provider is None:
             self._inference_provider = InferenceProvider()
 
-        # For local inference, also initialize direct references (used by some code paths)
-        if not self._inference_settings.is_cloud:
+        # For local DECIMER inference, also initialize direct references (used by some code paths)
+        # Skip for cloud and lightweight modes — they don't need TensorFlow/DECIMER
+        if not self._inference_settings.is_cloud and not self._inference_settings.is_lightweight:
             if self._structure_detector is None:
                 self._structure_detector = StructureDetector()
             if self._smiles_predictor is None:
@@ -231,6 +247,68 @@ class ProcessingWorker(QThread):
                 total_pages = pdf_info.page_count
                 overall_total_pages += total_pages
 
+                # Auto-detect structure pages if enabled
+                effective_page_filter = self._page_filter
+                if self._auto_detect_pages:
+                    self._emit_progress(
+                        0, total_pages, 0, 0,
+                        f"File {file_num}/{total_files}: Scanning pages for structures..."
+                    )
+                    try:
+                        from ..core.page_classifier import PageClassifier
+                        classifier = PageClassifier()
+
+                        def scan_progress(current, total):
+                            if self._is_cancelled():
+                                return
+                            self._emit_progress(
+                                current, total, 0, 0,
+                                f"File {file_num}/{total_files}: Scanning page {current}/{total}..."
+                            )
+
+                        auto_detected = set(classifier.detect_structure_pages(
+                            pdf_path, progress_callback=scan_progress
+                        ))
+
+                        if auto_detected:
+                            if effective_page_filter:
+                                # Intersect with user's manual page filter
+                                effective_page_filter = effective_page_filter & auto_detected
+                                if not effective_page_filter:
+                                    msg = (
+                                        f"{file_name}: No structure pages found within "
+                                        f"specified page range. Skipping file."
+                                    )
+                                    self.warning_occurred.emit(msg)
+                                    self._emit_progress(
+                                        total_pages, total_pages, 0, 0, msg
+                                    )
+                                    self._pdf_processor.close()
+                                    continue
+                            else:
+                                effective_page_filter = auto_detected
+
+                            self._emit_progress(
+                                0, total_pages, 0, 0,
+                                f"File {file_num}/{total_files}: Found {len(effective_page_filter)} "
+                                f"structure pages out of {total_pages}"
+                            )
+                        else:
+                            msg = f"{file_name}: No structure pages detected. Skipping file."
+                            self.warning_occurred.emit(msg)
+                            self._emit_progress(
+                                total_pages, total_pages, 0, 0, msg
+                            )
+                            self._pdf_processor.close()
+                            continue
+
+                    except Exception as e:
+                        # Auto-detection failed — fall back to processing all pages
+                        self._emit_progress(
+                            0, total_pages, 0, 0,
+                            f"File {file_num}/{total_files}: Page scan failed ({e}), processing all pages..."
+                        )
+
                 # Track compound ID for sequential assignment across pages
                 next_compound_id = 1
 
@@ -241,7 +319,7 @@ class ProcessingWorker(QThread):
                         break
 
                     # Skip pages not in filter
-                    if self._page_filter and page_num not in self._page_filter:
+                    if effective_page_filter and page_num not in effective_page_filter:
                         continue
 
                     overall_current_page += 1
@@ -364,7 +442,7 @@ class ProcessingWorker(QThread):
                     )
                     try:
                         bio_data = self._bio_data_extractor.extract_from_pdf(
-                            pdf_path, page_filter=self._page_filter
+                            pdf_path, page_filter=effective_page_filter
                         )
 
                         if bio_data:

@@ -26,6 +26,14 @@ class InferenceSettingsDialog(QDialog):
         mode_group = QGroupBox("Inference Mode")
         mode_layout = QVBoxLayout(mode_group)
 
+        self._radio_lightweight = QRadioButton("Local Lightweight (recommended)")
+        self._radio_lightweight.setToolTip(
+            "Fast CPU inference using MolScribe.\n"
+            "Works on any machine. No GPU or cloud required.\n"
+            "~1-2 sec per structure."
+        )
+        mode_layout.addWidget(self._radio_lightweight)
+
         self._radio_cloud = QRadioButton("Cloud GPU (Modal.com)")
         self._radio_cloud.setToolTip(
             "Use cloud GPU for fast inference.\n"
@@ -42,9 +50,9 @@ class InferenceSettingsDialog(QDialog):
         )
         mode_layout.addWidget(self._radio_local_gpu)
 
-        self._radio_local_cpu = QRadioButton("Local CPU (slow)")
+        self._radio_local_cpu = QRadioButton("Local CPU (DECIMER, slow)")
         self._radio_local_cpu.setToolTip(
-            "Use CPU for inference.\n"
+            "Use CPU for inference via DECIMER/TensorFlow.\n"
             "Works everywhere but is slow.\n"
             "~5-10 seconds per structure."
         )
@@ -103,6 +111,7 @@ class InferenceSettingsDialog(QDialog):
         self._load_settings()
 
         # Connect radio buttons to update cloud settings visibility
+        self._radio_lightweight.toggled.connect(self._on_mode_changed)
         self._radio_cloud.toggled.connect(self._on_mode_changed)
         self._radio_local_gpu.toggled.connect(self._on_mode_changed)
         self._radio_local_cpu.toggled.connect(self._on_mode_changed)
@@ -118,6 +127,8 @@ class InferenceSettingsDialog(QDialog):
             self._radio_cloud.setChecked(True)
         elif mode == InferenceMode.LOCAL_GPU:
             self._radio_local_gpu.setChecked(True)
+        elif mode == InferenceMode.LOCAL_LIGHTWEIGHT:
+            self._radio_lightweight.setChecked(True)
         else:
             self._radio_local_cpu.setChecked(True)
 
@@ -197,7 +208,9 @@ class InferenceSettingsDialog(QDialog):
     def _on_accept(self) -> None:
         """Save settings and close dialog."""
         # Determine selected mode
-        if self._radio_cloud.isChecked():
+        if self._radio_lightweight.isChecked():
+            mode = InferenceMode.LOCAL_LIGHTWEIGHT
+        elif self._radio_cloud.isChecked():
             mode = InferenceMode.CLOUD
         elif self._radio_local_gpu.isChecked():
             mode = InferenceMode.LOCAL_GPU
@@ -223,7 +236,9 @@ class InferenceSettingsDialog(QDialog):
 
     def get_selected_mode(self) -> InferenceMode:
         """Get the selected inference mode."""
-        if self._radio_cloud.isChecked():
+        if self._radio_lightweight.isChecked():
+            return InferenceMode.LOCAL_LIGHTWEIGHT
+        elif self._radio_cloud.isChecked():
             return InferenceMode.CLOUD
         elif self._radio_local_gpu.isChecked():
             return InferenceMode.LOCAL_GPU

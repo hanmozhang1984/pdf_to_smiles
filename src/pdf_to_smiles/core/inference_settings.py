@@ -10,9 +10,34 @@ import os
 
 class InferenceMode(Enum):
     """Available inference modes."""
-    LOCAL_CPU = "cpu"        # Local CPU (slow but works everywhere)
-    LOCAL_GPU = "gpu"        # Local GPU (requires NVIDIA + CUDA)
-    CLOUD = "cloud"          # Cloud GPU via Modal.com
+    LOCAL_LIGHTWEIGHT = "lightweight"  # MolScribe + OpenCV (fast, no TF)
+    LOCAL_CPU = "cpu"                 # Local CPU via DECIMER (slow but works everywhere)
+    LOCAL_GPU = "gpu"                 # Local GPU (requires NVIDIA + CUDA)
+    CLOUD = "cloud"                   # Cloud GPU via Modal.com
+
+
+def _auto_detect_best_mode() -> InferenceMode:
+    """Auto-detect the best available inference mode.
+
+    Priority: MolScribe (lightweight) > DECIMER (TF) > lightweight recommendation.
+    """
+    # Check for MolScribe + PyTorch first (lightweight)
+    try:
+        import molscribe  # noqa: F401
+        import torch  # noqa: F401
+        return InferenceMode.LOCAL_LIGHTWEIGHT
+    except ImportError:
+        pass
+
+    # Check for DECIMER + TensorFlow
+    try:
+        import DECIMER  # noqa: F401
+        return InferenceMode.LOCAL_CPU
+    except ImportError:
+        pass
+
+    # Fall back to lightweight (will prompt user to install on first use)
+    return InferenceMode.LOCAL_LIGHTWEIGHT
 
 
 class InferenceSettings:
@@ -32,9 +57,10 @@ class InferenceSettings:
     )
 
     def __init__(self):
-        self._mode: InferenceMode = InferenceMode.LOCAL_CPU
+        self._mode: InferenceMode = InferenceMode.LOCAL_LIGHTWEIGHT
         self._cloud_endpoint: Optional[str] = None
         self._cloud_timeout: int = 300  # 5 minutes for cold starts
+        self._auto_detect_pages: bool = True
         self._load_settings()
 
     @classmethod
@@ -78,6 +104,17 @@ class InferenceSettings:
         self._save_settings()
 
     @property
+    def auto_detect_pages(self) -> bool:
+        """Whether to auto-detect structure pages before processing."""
+        return self._auto_detect_pages
+
+    @auto_detect_pages.setter
+    def auto_detect_pages(self, value: bool) -> None:
+        """Set auto-detect pages preference."""
+        self._auto_detect_pages = value
+        self._save_settings()
+
+    @property
     def is_cloud(self) -> bool:
         """Check if using cloud inference."""
         return self._mode == InferenceMode.CLOUD
@@ -87,16 +124,25 @@ class InferenceSettings:
         """Check if using local GPU inference."""
         return self._mode == InferenceMode.LOCAL_GPU
 
+    @property
+    def is_lightweight(self) -> bool:
+        """Check if using lightweight local inference (MolScribe + OpenCV)."""
+        return self._mode == InferenceMode.LOCAL_LIGHTWEIGHT
+
     def _load_settings(self) -> None:
         """Load settings from config file."""
         try:
             if os.path.exists(self._config_file):
                 with open(self._config_file, 'r') as f:
                     data = json.load(f)
-                    mode_str = data.get("mode", "cpu")
-                    self._mode = InferenceMode(mode_str)
+                    mode_str = data.get("mode", "lightweight")
+                    try:
+                        self._mode = InferenceMode(mode_str)
+                    except ValueError:
+                        self._mode = InferenceMode.LOCAL_LIGHTWEIGHT
                     self._cloud_endpoint = data.get("cloud_endpoint")
                     self._cloud_timeout = data.get("cloud_timeout", 300)
+                    self._auto_detect_pages = data.get("auto_detect_pages", True)
         except Exception:
             pass  # Use defaults if loading fails
 
@@ -108,7 +154,8 @@ class InferenceSettings:
                 json.dump({
                     "mode": self._mode.value,
                     "cloud_endpoint": self._cloud_endpoint,
-                    "cloud_timeout": self._cloud_timeout
+                    "cloud_timeout": self._cloud_timeout,
+                    "auto_detect_pages": self._auto_detect_pages
                 }, f, indent=2)
         except Exception:
             pass  # Ignore save errors
@@ -119,5 +166,7 @@ class InferenceSettings:
             return "Cloud GPU (Modal.com)"
         elif self._mode == InferenceMode.LOCAL_GPU:
             return "Local GPU (CUDA)"
+        elif self._mode == InferenceMode.LOCAL_LIGHTWEIGHT:
+            return "Local Lightweight (MolScribe)"
         else:
-            return "Local CPU (slow)"
+            return "Local CPU (DECIMER, slow)"

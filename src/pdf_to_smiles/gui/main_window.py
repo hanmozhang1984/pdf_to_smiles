@@ -435,6 +435,8 @@ class MainWindow(QMainWindow):
         )
         settings_layout.addWidget(self._txt_page_range)
 
+        detect_row = QHBoxLayout()
+
         self._btn_detect_pages = QPushButton("Detect Pages")
         self._btn_detect_pages.setFixedHeight(22)
         self._btn_detect_pages.setToolTip(
@@ -443,7 +445,17 @@ class MainWindow(QMainWindow):
         )
         self._btn_detect_pages.clicked.connect(self._on_detect_pages)
         self._btn_detect_pages.setEnabled(False)
-        settings_layout.addWidget(self._btn_detect_pages)
+        detect_row.addWidget(self._btn_detect_pages)
+
+        self._chk_auto_detect = QCheckBox("Auto-detect")
+        self._chk_auto_detect.setChecked(self._get_auto_detect_setting())
+        self._chk_auto_detect.setToolTip(
+            "Automatically skip text-only pages before processing.\n"
+            "Fast: ~0.1 sec/page."
+        )
+        detect_row.addWidget(self._chk_auto_detect)
+
+        settings_layout.addLayout(detect_row)
 
         layout.addWidget(settings_group)
 
@@ -1019,12 +1031,17 @@ class MainWindow(QMainWindow):
         self._worker.set_pdf_paths(pdf_paths)
         self._worker.set_page_filter(page_filter)
         self._worker.set_high_accuracy_mode(self._chk_high_accuracy.isChecked())
+        self._worker.set_auto_detect_pages(self._chk_auto_detect.isChecked())
+
+        # Persist auto-detect setting
+        self._inference_settings.auto_detect_pages = self._chk_auto_detect.isChecked()
 
         # Connect signals
         self._worker.progress_updated.connect(self._on_progress_updated)
         self._worker.result_ready.connect(self._on_result_ready)
         self._worker.processing_complete.connect(self._on_processing_complete)
         self._worker.error_occurred.connect(self._on_error)
+        self._worker.warning_occurred.connect(self._on_worker_warning)
 
         self._worker.start()
         self._update_button_states()
@@ -2120,6 +2137,11 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Processing Error", error_message)
         self._statusbar.showMessage("Error occurred")
 
+    @Slot(str)
+    def _on_worker_warning(self, message: str) -> None:
+        """Handle non-fatal warning from worker."""
+        self._statusbar.showMessage(message, 10000)
+
     @Slot(int, int)
     def _on_cell_double_clicked(self, row: int, column: int) -> None:
         """Handle double-click on table cell to copy SMILES."""
@@ -2132,6 +2154,10 @@ class MainWindow(QMainWindow):
                     clipboard.setText(smiles)
                     self._statusbar.showMessage(f"Copied SMILES to clipboard: {smiles[:50]}...")
 
+    def _get_auto_detect_setting(self) -> bool:
+        """Get the persisted auto-detect pages setting."""
+        return InferenceSettings.get_instance().auto_detect_pages
+
     def _get_inference_mode_text(self) -> str:
         """Get display text for current inference mode."""
         mode = self._inference_settings.mode
@@ -2139,6 +2165,8 @@ class MainWindow(QMainWindow):
             return "Mode: Cloud GPU"
         elif mode == InferenceMode.LOCAL_GPU:
             return "Mode: Local GPU"
+        elif mode == InferenceMode.LOCAL_LIGHTWEIGHT:
+            return "Mode: Lightweight"
         else:
             return "Mode: Local CPU"
 

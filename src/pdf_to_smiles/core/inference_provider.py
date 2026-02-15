@@ -11,8 +11,8 @@ from .inference_settings import InferenceSettings, InferenceMode
 class InferenceProvider:
     """Unified interface for structure detection and SMILES prediction.
 
-    Automatically routes requests to local or cloud backends based on
-    InferenceSettings configuration.
+    Automatically routes requests to local, lightweight, or cloud backends
+    based on InferenceSettings configuration.
 
     Usage:
         provider = InferenceProvider()
@@ -27,21 +27,37 @@ class InferenceProvider:
         # Lazy-loaded backends
         self._local_detector = None
         self._local_predictor = None
+        self._lightweight_detector = None
+        self._lightweight_predictor = None
         self._cloud_client = None
 
     def _get_local_detector(self):
-        """Get or create local structure detector."""
+        """Get or create local structure detector (DECIMER)."""
         if self._local_detector is None:
             from .structure_detector import StructureDetector
             self._local_detector = StructureDetector()
         return self._local_detector
 
     def _get_local_predictor(self):
-        """Get or create local SMILES predictor."""
+        """Get or create local SMILES predictor (DECIMER)."""
         if self._local_predictor is None:
             from .smiles_predictor import SMILESPredictor
             self._local_predictor = SMILESPredictor()
         return self._local_predictor
+
+    def _get_lightweight_detector(self):
+        """Get or create lightweight structure detector (OpenCV)."""
+        if self._lightweight_detector is None:
+            from .lightweight_detector import LightweightDetector
+            self._lightweight_detector = LightweightDetector()
+        return self._lightweight_detector
+
+    def _get_lightweight_predictor(self):
+        """Get or create lightweight SMILES predictor (MolScribe)."""
+        if self._lightweight_predictor is None:
+            from .lightweight_predictor import LightweightPredictor
+            self._lightweight_predictor = LightweightPredictor()
+        return self._lightweight_predictor
 
     def _get_cloud_client(self):
         """Get or create cloud inference client."""
@@ -65,6 +81,9 @@ class InferenceProvider:
         if self._settings.is_cloud:
             client = self._get_cloud_client()
             return client.segment_structures(page_image)
+        elif self._settings.is_lightweight:
+            detector = self._get_lightweight_detector()
+            return detector.detect_structures(page_image)
         else:
             detector = self._get_local_detector()
             return detector.detect_structures(page_image)
@@ -87,6 +106,9 @@ class InferenceProvider:
         if self._settings.is_cloud:
             client = self._get_cloud_client()
             return client.predict_smiles(structure_image)
+        elif self._settings.is_lightweight:
+            predictor = self._get_lightweight_predictor()
+            return predictor.predict(structure_image, high_accuracy=high_accuracy)
         else:
             predictor = self._get_local_predictor()
             return predictor.predict(structure_image, high_accuracy=high_accuracy)
@@ -109,6 +131,9 @@ class InferenceProvider:
         if self._settings.is_cloud:
             client = self._get_cloud_client()
             return client.predict_smiles_batch(structure_images)
+        elif self._settings.is_lightweight:
+            predictor = self._get_lightweight_predictor()
+            return predictor.predict_batch(structure_images, high_accuracy=high_accuracy)
         else:
             predictor = self._get_local_predictor()
             return predictor.predict_batch(structure_images, high_accuracy=high_accuracy)
@@ -129,6 +154,17 @@ class InferenceProvider:
             except Exception as e:
                 return False, f"Cloud connection failed: {e}"
 
+        elif self._settings.is_lightweight:
+            try:
+                import molscribe  # noqa: F401
+                import torch  # noqa: F401
+                return True, "Lightweight mode ready (MolScribe + OpenCV)"
+            except ImportError:
+                return False, (
+                    "MolScribe not installed. Install with:\n"
+                    "pip install molscribe torch"
+                )
+
         elif self._settings.is_local_gpu:
             try:
                 import tensorflow as tf
@@ -140,8 +176,15 @@ class InferenceProvider:
             except Exception as e:
                 return False, f"GPU check failed: {e}"
 
-        else:  # CPU mode
-            return True, "CPU mode (processing will be slow)"
+        else:  # CPU mode (DECIMER)
+            try:
+                import DECIMER  # noqa: F401
+                return True, "CPU mode ready (DECIMER, processing will be slow)"
+            except ImportError:
+                return False, (
+                    "DECIMER not installed. Install with:\n"
+                    "pip install decimer decimer-segmentation tensorflow"
+                )
 
     @property
     def mode(self) -> InferenceMode:

@@ -1,0 +1,21 @@
+# Mac ARM64 (Apple Silicon) dependencies
+# Install with: pip install -r requirements-mac.txt
+
+# Core GUI & PDF
+PySide6>=6.6.0
+pypdfium2>=5.0
+pdfplumber>=0.10
+rdkit>=2024.3
+opencv-python>=4.9
+Pillow>=10.0
+pandas>=2.0
+pytesseract>=0.3.13
+requests>=2.31
+
+# Local inference — Apple Silicon native
+# DECIMER requires TF<=2.15; for ARM64 Mac that means tensorflow-macos
+tensorflow-macos>=2.12,<=2.15
+tensorflow-metal
+decimer>=2.7.0
+decimer-segmentation>=1.4.0
+numpy>=1.23,<2.0

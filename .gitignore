@@ -1,0 +1,18 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.csv
+*.txt
+!requirements.txt
+!requirements-*.txt
+
+# Build artifacts
+*.zip
+Output/
+run_build.bat

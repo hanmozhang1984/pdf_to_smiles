@@ -1,0 +1,16 @@
+# Local inference dependencies
+# Install with: pip install -r requirements-local.txt
+#
+# This enables local CPU/GPU inference using DECIMER models.
+# Requires ~2GB disk space for model downloads.
+# GPU inference requires NVIDIA GPU + CUDA 11.8 drivers.
+
+-r requirements.txt
+
+# DECIMER models for local inference
+decimer==2.7.0
+decimer-segmentation==1.4.0
+
+# TensorFlow for DECIMER (pinned for compatibility)
+tensorflow==2.12.0
+numpy==1.23.5

@@ -1,0 +1,118 @@
+pdf-to-smiles
+Copyright (c) 2024 ChemCipher
+
+This software includes the following third-party components:
+
+================================================================================
+DECIMER (Deep Learning for Chemical Image Recognition)
+================================================================================
+Copyright (c) Kohulan Rajan
+License: MIT
+Source: https://github.com/Kohulan/DECIMER-Image_Transformer
+
+If you use DECIMER in your work, please cite:
+- Rajan, K., Zielesny, A. & Steinbeck, C. DECIMER 1.0: deep learning for
+  chemical image recognition using transformers. J Cheminform 13, 61 (2021).
+  https://doi.org/10.1186/s13321-021-00538-8
+
+================================================================================
+DECIMER-Segmentation
+================================================================================
+Copyright (c) Kohulan Rajan
+License: MIT
+Source: https://github.com/Kohulan/DECIMER-Image-Segmentation
+
+If you use DECIMER-Segmentation in your work, please cite:
+- Rajan, K., Brinkhaus, H.O., Sorokina, M. et al. DECIMER.ai: an open platform
+  for automated optical chemical structure identification, segmentation and
+  recognition in scientific publications. Nat Commun 14, 5045 (2023).
+  https://doi.org/10.1038/s41467-023-40782-0
+
+================================================================================
+RDKit
+================================================================================
+Copyright (c) RDKit contributors
+License: BSD-3-Clause
+Source: https://github.com/rdkit/rdkit
+
+================================================================================
+TensorFlow
+================================================================================
+Copyright (c) The TensorFlow Authors
+License: Apache License 2.0
+Source: https://github.com/tensorflow/tensorflow
+
+================================================================================
+PySide6 (Qt for Python)
+================================================================================
+Copyright (c) The Qt Company Ltd.
+License: LGPL v3
+Source: https://www.qt.io/qt-for-python
+
+================================================================================
+pypdfium2
+================================================================================
+Copyright (c) pypdfium2-team
+License: Apache License 2.0 / BSD-3-Clause
+Source: https://github.com/pypdfium2-team/pypdfium2
+
+PDFium is Copyright (c) The PDFium Authors, licensed under Apache License 2.0.
+
+================================================================================
+pdfplumber
+================================================================================
+Copyright (c) Jeremy Singer-Vine
+License: MIT
+Source: https://github.com/jsvine/pdfplumber
+
+================================================================================
+OpenCV (opencv-python)
+================================================================================
+Copyright (c) OpenCV team
+License: Apache License 2.0
+Source: https://github.com/opencv/opencv-python
+
+================================================================================
+Pillow
+================================================================================
+Copyright (c) Jeffrey A. Clark and contributors
+License: HPND (Historical Permission Notice and Disclaimer)
+Source: https://github.com/python-pillow/Pillow
+
+================================================================================
+NumPy
+================================================================================
+Copyright (c) NumPy Developers
+License: BSD-3-Clause
+Source: https://github.com/numpy/numpy
+
+================================================================================
+pandas
+================================================================================
+Copyright (c) pandas Development Team
+License: BSD-3-Clause
+Source: https://github.com/pandas-dev/pandas
+
+================================================================================
+pytesseract
+================================================================================
+Copyright (c) Matthias Lee
+License: Apache License 2.0
+Source: https://github.com/madmaze/pytesseract
+
+Tesseract OCR is Copyright (c) Google Inc., licensed under Apache License 2.0.
+Source: https://github.com/tesseract-ocr/tesseract
+
+================================================================================
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use files from Apache-licensed components except in compliance
+with the License. You may obtain a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.

@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-to-smiles"
+version = "1.0.0"
+description = "A desktop GUI application that extracts chemical structure images from PDF files and converts them to SMILES strings using deep learning"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "ChemCipher"}
+]
+keywords = ["chemistry", "SMILES", "PDF", "DECIMER", "chemical structures", "OCR"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+dependencies = [
+    "PySide6>=6.6.0",
+    "pypdfium2>=4.0.0",
+    "pdfplumber>=0.10.0",
+    "decimer>=2.7.0",
+    "decimer-segmentation>=1.4.0",
+    "rdkit>=2024.03.1",
+    "opencv-python>=4.9.0",
+    "Pillow>=10.0.0",
+    "tensorflow>=2.15.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "flake8>=6.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+]
+
+[project.scripts]
+pdf-to-smiles = "pdf_to_smiles.main:main"
+
+[project.urls]
+Homepage = "https://github.com/chemcipher/pdf-to-smiles"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,22 @@
+# Core dependencies with pinned versions
+PySide6==6.10.1
+pypdfium2==5.3.0
+pdfplumber==0.11.8
+rdkit==2025.9.2
+opencv-python==4.9.0.80
+Pillow==11.3.0
+pandas==2.3.3
+pytesseract==0.3.13
+requests==2.32.5
+
+# Cloud deployment (only needed if deploying your own Modal backend)
+# modal==0.66.0
+
+# =============================================================================
+# LOCAL INFERENCE (optional - only needed if running inference locally)
+# Uncomment the following lines to enable local CPU/GPU inference:
+# =============================================================================
+# decimer==2.7.0
+# decimer-segmentation==1.4.0
+# tensorflow==2.12.0
+# numpy==1.23.5

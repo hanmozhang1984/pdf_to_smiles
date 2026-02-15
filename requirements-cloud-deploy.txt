@@ -1,0 +1,7 @@
+# Cloud deployment dependencies
+# Install with: pip install -r requirements-cloud-deploy.txt
+#
+# This enables deploying the Modal.com GPU backend.
+# You also need a Modal account: https://modal.com
+
+modal>=0.66.0

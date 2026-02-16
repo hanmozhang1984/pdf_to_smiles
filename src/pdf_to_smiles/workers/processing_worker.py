@@ -247,9 +247,11 @@ class ProcessingWorker(QThread):
                 total_pages = pdf_info.page_count
                 overall_total_pages += total_pages
 
-                # Auto-detect structure pages if enabled
+                # Determine which pages to process
+                # If user provided a manual page range, respect it (skip auto-detect)
+                # If no manual range, use auto-detect to skip text-only pages
                 effective_page_filter = self._page_filter
-                if self._auto_detect_pages:
+                if self._auto_detect_pages and not self._page_filter:
                     self._emit_progress(
                         0, total_pages, 0, 0,
                         f"File {file_num}/{total_files}: Scanning pages for structures..."
@@ -271,23 +273,7 @@ class ProcessingWorker(QThread):
                         ))
 
                         if auto_detected:
-                            if effective_page_filter:
-                                # Intersect with user's manual page filter
-                                effective_page_filter = effective_page_filter & auto_detected
-                                if not effective_page_filter:
-                                    msg = (
-                                        f"{file_name}: No structure pages found within "
-                                        f"specified page range. Skipping file."
-                                    )
-                                    self.warning_occurred.emit(msg)
-                                    self._emit_progress(
-                                        total_pages, total_pages, 0, 0, msg
-                                    )
-                                    self._pdf_processor.close()
-                                    continue
-                            else:
-                                effective_page_filter = auto_detected
-
+                            effective_page_filter = auto_detected
                             self._emit_progress(
                                 0, total_pages, 0, 0,
                                 f"File {file_num}/{total_files}: Found {len(effective_page_filter)} "
@@ -311,6 +297,19 @@ class ProcessingWorker(QThread):
 
                 # Track compound ID for sequential assignment across pages
                 next_compound_id = 1
+
+                # Show which pages will be processed
+                if effective_page_filter:
+                    page_count = len(effective_page_filter)
+                    self._emit_progress(
+                        0, total_pages, 0, 0,
+                        f"File {file_num}/{total_files}: Processing {page_count} pages..."
+                    )
+                else:
+                    self._emit_progress(
+                        0, total_pages, 0, 0,
+                        f"File {file_num}/{total_files}: Processing all {total_pages} pages..."
+                    )
 
                 # Process each page
                 for page_num in range(1, total_pages + 1):
@@ -441,8 +440,10 @@ class ProcessingWorker(QThread):
                         f"File {file_num}/{total_files}: Extracting biological data..."
                     )
                     try:
+                        # Use user's original page filter (not auto-detected),
+                        # because bio data tables are on different pages than structures
                         bio_data = self._bio_data_extractor.extract_from_pdf(
-                            pdf_path, page_filter=effective_page_filter
+                            pdf_path, page_filter=self._page_filter
                         )
 
                         if bio_data:

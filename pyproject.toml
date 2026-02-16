@@ -37,8 +37,11 @@ dependencies = [
 
 [project.optional-dependencies]
 lightweight = [
-    "molscribe>=1.0",
-    "torch>=1.11.0",
+    "molscribe>=1.1.1",
+    "torch>=2.0.0",
+    "albumentations==1.1.0",
+    "timm==0.4.12",
+    "OpenNMT-py==2.2.0",
 ]
 decimer = [
     "decimer>=2.7.0",

@@ -16,8 +16,11 @@ requests==2.32.5
 # LIGHTWEIGHT LOCAL INFERENCE (recommended)
 # Fast CPU inference using MolScribe + OpenCV (no TensorFlow needed):
 # =============================================================================
-# molscribe>=1.0
-# torch>=1.11.0
+# molscribe>=1.1.1
+# torch>=2.0.0
+# albumentations==1.1.0
+# timm==0.4.12
+# OpenNMT-py==2.2.0
 
 # =============================================================================
 # DECIMER LOCAL INFERENCE (optional - heavier, requires TensorFlow)

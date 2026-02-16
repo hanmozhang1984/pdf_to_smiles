@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional, List
 
+import numpy as np
 from PIL import Image
 
 
@@ -23,6 +24,10 @@ class LightweightPredictor:
         self._model = None
         self._initialized = False
 
+    # HuggingFace repo and default checkpoint for MolScribe
+    _HF_REPO = "yujieq/MolScribe"
+    _HF_FILENAME = "swin_base_char_aux_1m.pth"
+
     def _ensure_initialized(self) -> None:
         """Lazy initialization — downloads model on first use."""
         if self._initialized:
@@ -31,14 +36,51 @@ class LightweightPredictor:
         try:
             import torch
             from molscribe import MolScribe
+            from huggingface_hub import hf_hub_download
+
+            # Download checkpoint from HuggingFace Hub (cached after first download)
+            model_path = hf_hub_download(self._HF_REPO, self._HF_FILENAME)
 
             device = torch.device('cpu')
-            self._model = MolScribe(device=device)
+            self._model = MolScribe(model_path, device=device)
+
+            # Patch MolScribe bugs:
+            # 1. BOND_TYPES missing key 0 → KeyError expanding CF3, NO2, etc.
+            # 2. convert_graph_to_smiles uses multiprocessing.Pool which fails
+            #    when run from non-file contexts (stdin, frozen apps, threads).
+            # Fix: patch BOND_TYPES and replace with single-process version.
+            try:
+                from rdkit import Chem
+                import molscribe.chemistry as msc
+                import molscribe.interface as msi
+                if 0 not in msc.BOND_TYPES:
+                    msc.BOND_TYPES[0] = Chem.BondType.SINGLE
+
+                def _convert_graph_to_smiles_single(coords, symbols, edges,
+                                                     images=None, num_workers=1):
+                    if images is None:
+                        images_iter = [None] * len(coords)
+                    else:
+                        images_iter = images
+                    results = [
+                        msc._convert_graph_to_smiles(c, s, e, img)
+                        for c, s, e, img in zip(coords, symbols, edges, images_iter)
+                    ]
+                    smiles_list, molblock_list, success = zip(*results)
+                    r_success = np.mean(success)
+                    return smiles_list, molblock_list, r_success
+
+                # Patch both the module and the local binding in interface.py
+                msc.convert_graph_to_smiles = _convert_graph_to_smiles_single
+                msi.convert_graph_to_smiles = _convert_graph_to_smiles_single
+            except Exception:
+                pass
+
             self._initialized = True
         except ImportError as e:
             raise RuntimeError(
                 "MolScribe is not installed. Install with:\n"
-                "  pip install molscribe torch\n"
+                "  pip install molscribe torch huggingface_hub\n"
                 f"Original error: {e}"
             ) from e
 
@@ -62,11 +104,12 @@ class LightweightPredictor:
         self._ensure_initialized()
 
         try:
-            # MolScribe expects RGB PIL Image
+            # MolScribe expects numpy array (RGB)
             if structure_image.mode != 'RGB':
                 structure_image = structure_image.convert('RGB')
+            img_array = np.array(structure_image)
 
-            output = self._model.predict_image(structure_image)
+            output = self._model.predict_image(img_array)
 
             if isinstance(output, dict):
                 smiles = output.get('smiles', '')
@@ -77,14 +120,16 @@ class LightweightPredictor:
 
             if smiles and isinstance(smiles, str) and len(smiles.strip()) > 0:
                 result = smiles.strip()
-                # Validate with RDKit if available
-                if high_accuracy and not self._is_valid_smiles(result):
+                # Always validate with RDKit — rejects garbage from non-structure inputs
+                if not self._is_valid_smiles(result):
                     return None
                 return result
             return None
 
         except Exception as e:
+            import traceback
             print(f"MolScribe prediction failed: {e}")
+            traceback.print_exc()
             return None
 
     def predict_batch(
@@ -104,14 +149,14 @@ class LightweightPredictor:
         self._ensure_initialized()
 
         try:
-            # Ensure all images are RGB
-            rgb_images = []
+            # MolScribe expects numpy arrays (RGB)
+            np_images = []
             for img in structure_images:
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
-                rgb_images.append(img)
+                np_images.append(np.array(img))
 
-            outputs = self._model.predict_images(rgb_images)
+            outputs = self._model.predict_images(np_images)
 
             results = []
             for output in outputs:
@@ -125,7 +170,7 @@ class LightweightPredictor:
 
                 if smiles and isinstance(smiles, str) and len(smiles.strip()) > 0:
                     result = smiles.strip()
-                    if high_accuracy and not self._is_valid_smiles(result):
+                    if not self._is_valid_smiles(result):
                         results.append(None)
                     else:
                         results.append(result)
@@ -140,10 +185,19 @@ class LightweightPredictor:
 
     @staticmethod
     def _is_valid_smiles(smiles: str) -> bool:
-        """Quick check if SMILES is likely valid using RDKit."""
+        """Check if SMILES is a valid, plausible chemical structure."""
         try:
             from rdkit import Chem
             mol = Chem.MolFromSmiles(smiles)
-            return mol is not None
+            if mol is None:
+                return False
+            # Reject wildcard-heavy fragments (from non-structure images)
+            num_atoms = mol.GetNumAtoms()
+            if num_atoms < 3:
+                return False
+            wildcards = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 0)
+            if wildcards > num_atoms * 0.3:
+                return False
+            return True
         except Exception:
             return False

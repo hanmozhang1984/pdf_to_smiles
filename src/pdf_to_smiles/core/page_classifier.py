@@ -20,8 +20,8 @@ class PageClassifier:
     DARK_THRESHOLD = 200        # Grayscale value below which pixels are "dark"
     STRIP_HEIGHT = 40           # Horizontal strip height in pixels
     MIN_DARK_RATIO = 0.005      # Minimum dark pixel ratio in a strip to consider
-    MAX_SPREAD_RATIO = 0.65     # Max spread ratio for "localized" (not full-width text)
-    MIN_STRUCTURE_STRIPS = 3    # Minimum strips with localized dark clusters
+    MAX_SPREAD_RATIO = 0.80     # Max spread ratio for "localized" (not full-width text)
+    MIN_STRUCTURE_STRIPS = 2    # Minimum strips with localized dark clusters
     MIN_CLUSTER_SIZE = 80       # Minimum contiguous dark region size (px) at 72 DPI
 
     # Thresholds for bio table detection

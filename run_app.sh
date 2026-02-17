@@ -1,6 +1,7 @@
-#!/bin/bash
-# Launch script for Mac/Linux
+#!/usr/bin/env bash
+# Launch PDF to SMILES on macOS/Linux
+set -e
 
-cd "$(dirname "$0")/src"
-source ../venv/bin/activate
-python -m pdf_to_smiles.main
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/venv/bin/activate"
+python -m pdf_to_smiles "$@"

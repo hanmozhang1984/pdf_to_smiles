@@ -505,6 +505,25 @@ class BiologicalDataExtractor:
         """Get list of all compound IDs that were extracted."""
         return list(self._last_extracted_data.keys())
 
+    @staticmethod
+    def _pdfplumber_data_is_low_quality(data: Dict[str, 'BiologicalData']) -> bool:
+        """Check if pdfplumber extraction produced low-quality results.
+
+        Returns True if the data has few compounds or many empty assay values,
+        suggesting pdfplumber misparssed the table and OCR should also be tried.
+        """
+        if len(data) < 2:
+            return True
+        # Count compounds with at least one assay value
+        has_value = 0
+        for bio in data.values():
+            if bio.ic50 or bio.ec50 or bio.ki or bio.kd or bio.other_assays:
+                has_value += 1
+        # Low quality if >50% of compounds have no assay values
+        if has_value < len(data) * 0.5:
+            return True
+        return False
+
     def _extract_from_page(
         self,
         plumber_page,
@@ -539,6 +558,43 @@ class BiologicalDataExtractor:
                             self._merge_bio_data(data[compound_id], bio_data)
                         else:
                             data[compound_id] = bio_data
+
+            # If pdfplumber found data but it's low quality, also try OCR
+            # and merge/prefer the better result
+            if data and self._pdfplumber_data_is_low_quality(data) and HAS_OCR:
+                self._debug_info.append(
+                    f"  pdfplumber data is low quality ({len(data)} compounds), "
+                    f"also trying OCR to supplement..."
+                )
+                ocr_data = self._extract_from_page_ocr(pdfium_page, page_num)
+                if ocr_data:
+                    self._debug_info.append(
+                        f"  OCR found {len(ocr_data)} compounds, merging with pdfplumber data"
+                    )
+                    # Merge: prefer pdfplumber where both have data, fill gaps from OCR
+                    for cid, ocr_bio in ocr_data.items():
+                        if cid in data:
+                            # Fill in missing values from OCR
+                            existing = data[cid]
+                            if not existing.ic50 and ocr_bio.ic50:
+                                existing.ic50 = ocr_bio.ic50
+                            if not existing.ec50 and ocr_bio.ec50:
+                                existing.ec50 = ocr_bio.ec50
+                            if not existing.ki and ocr_bio.ki:
+                                existing.ki = ocr_bio.ki
+                            if not existing.kd and ocr_bio.kd:
+                                existing.kd = ocr_bio.kd
+                            for assay_name, value in ocr_bio.other_assays.items():
+                                if assay_name not in existing.other_assays:
+                                    existing.other_assays[assay_name] = value
+                        else:
+                            data[cid] = ocr_bio
+                    # If OCR found significantly more data, prefer OCR entirely
+                    if len(ocr_data) > len(data) * 2:
+                        self._debug_info.append(
+                            f"  OCR has much more data, preferring OCR results"
+                        )
+                        data = ocr_data
 
             # If no tables found or no data extracted, try text-based extraction
             if not data:
@@ -665,10 +721,10 @@ class BiologicalDataExtractor:
     def _extract_patent_table_columns(self, pil_image, page_num: int) -> Dict[str, BiologicalData]:
         """Extract bio data from patent tables using full-page OCR with position filtering.
 
-        Targets the common patent table layout: Example | Structure (image) | IC50
-        Runs OCR on the full page at native resolution, finds the IC50 column
-        header position, then extracts example numbers from the left margin and
-        activity values from the IC50 column, matching by Y-position.
+        Targets the common patent table layout: Example | Structure (image) | IC50 | EC50
+        Runs OCR on the full page at native resolution, finds ALL assay column
+        header positions, then extracts example numbers from the left margin and
+        activity values from each assay column, matching by Y-position.
 
         Args:
             pil_image: PIL Image of the page (already at 200dpi rendering).
@@ -709,64 +765,137 @@ class BiologicalDataExtractor:
             if not words:
                 return data
 
-            # Find the IC50/assay column header and its X position
-            assay_header_x = None
-            assay_name = "IC50"
-
-            # Check for table indicators: "Example", "Structure", "IC50" etc.
+            # Find ALL assay column headers and their X positions
+            # Also find the "Example" / "Number" / "Compound" header to locate the ID column
+            # assay_columns: list of (assay_name, header_x_position)
+            assay_columns = []
+            example_header_x = None  # X position of the Example/Compound column header
+            example_header_y = None  # Y position — use to determine table start
             has_example = False
             has_structure = False
-            has_assay = False
 
             for w in words:
                 text_lower = w['text'].lower()
                 corrected = self._correct_ocr_assay_name(w['text']).lower()
 
-                if text_lower in ('example', 'synthetic'):
+                if text_lower in ('example', 'synthetic', 'compound', 'cpd', 'cmpd', 'number', 'no.', 'ex#', 'ex.#'):
                     has_example = True
+                    # Track the Example column header position (prefer "Example" over "Number")
+                    if text_lower in ('example', 'compound', 'cpd', 'cmpd', 'ex#', 'ex.#') or example_header_x is None:
+                        example_header_x = w['x']
+                        example_header_y = w['y']
                 if text_lower == 'structure':
                     has_structure = True
-                # Look for IC50/ICso/ICs0/etc. header (may have parentheses)
-                corrected_bare = re.sub(r'[()]', '', corrected)
-                if corrected_bare in ('ic50', 'icso', 'ics0') or 'ic50' in corrected:
-                    has_assay = True
-                    assay_header_x = w['x']
-                    assay_name = "IC50"
-                elif corrected_bare in ('ec50', 'ecso', 'ecs0') or 'ec50' in corrected:
-                    has_assay = True
-                    assay_header_x = w['x']
-                    assay_name = "EC50"
-                elif corrected_bare in ('gi50', 'giso', 'gis0') or 'gi50' in corrected:
-                    has_assay = True
-                    assay_header_x = w['x']
-                    assay_name = "GI50"
 
-            # Need example + assay indicator (structure alone is not enough)
-            if not has_assay:
+                corrected_bare = re.sub(r'[()]', '', corrected)
+
+                # Check each assay type and collect ALL matches
+                assay_match = None
+                if corrected_bare in ('ic50', 'icso', 'ics0') or 'ic50' in corrected:
+                    assay_match = "IC50"
+                elif corrected_bare in ('ec50', 'ecso', 'ecs0') or 'ec50' in corrected:
+                    assay_match = "EC50"
+                elif corrected_bare in ('gi50', 'giso', 'gis0') or 'gi50' in corrected:
+                    assay_match = "GI50"
+                elif corrected_bare in ('ki',) or re.match(r'^ki$', corrected_bare):
+                    assay_match = "Ki"
+                elif corrected_bare in ('kd',) or re.match(r'^kd$', corrected_bare):
+                    assay_match = "Kd"
+                elif re.match(r'^(?:cc50|ed50|ld50|ec90|ic90|mic|mec|emax)$', corrected_bare):
+                    assay_match = corrected_bare.upper()
+                # Also match generic "inhibition" / "activity" headers in right half
+                elif corrected_bare in ('inhibition', 'activity', 'potency') and w['x_pct'] > 30:
+                    assay_match = w['text']
+
+                if assay_match:
+                    # Avoid duplicates at same X position (±30px).
+                    # When a duplicate is found, prefer the one closest to
+                    # the Example header Y (likely the actual table header,
+                    # not a mention in descriptive text).
+                    dup_idx = None
+                    for idx, existing in enumerate(assay_columns):
+                        if abs(existing[1] - w['x']) < 30:
+                            dup_idx = idx
+                            break
+                    if dup_idx is not None:
+                        if example_header_y is not None:
+                            old_dist = abs(assay_columns[dup_idx][2] - example_header_y)
+                            new_dist = abs(w['y'] - example_header_y)
+                            if new_dist < old_dist:
+                                assay_columns[dup_idx] = (assay_match, w['x'], w['y'])
+                    else:
+                        assay_columns.append((assay_match, w['x'], w['y']))
+
+            # Sort assay columns by X position (left to right)
+            assay_columns.sort(key=lambda ac: ac[1])
+
+            # Filter assay columns: if we found an Example header, reject
+            # assay headers that are far from the Example header Y (likely
+            # from descriptive text paragraphs, not actual table headers)
+            if example_header_y is not None and len(assay_columns) > 0:
+                y_tol = 150  # pixels at 200dpi
+                filtered = [(n, x) for n, x, y in assay_columns
+                            if abs(y - example_header_y) < y_tol]
+                if filtered != [(n, x) for n, x, _ in assay_columns]:
+                    removed = [(n, x) for n, x, y in assay_columns
+                               if abs(y - example_header_y) >= y_tol]
+                    self._debug_info.append(
+                        f"  Filtered {len(removed)} assay headers far from table: {removed}"
+                    )
+                assay_columns_2d = filtered
+            else:
+                assay_columns_2d = [(n, x) for n, x, _ in assay_columns]
+            assay_columns = assay_columns_2d
+
+            if not assay_columns and example_header_x is None:
                 self._debug_info.append(
                     f"  Patent table columns: page {page_num} no assay header found "
-                    f"(example={has_example}, structure={has_structure}, assay={has_assay})"
+                    f"(example={has_example}, structure={has_structure})"
                 )
                 return data
 
             self._debug_info.append(
-                f"  Patent table columns: page {page_num} is table page "
-                f"(assay_header_x={assay_header_x}, assay={assay_name})"
+                f"  Patent table columns: page {page_num} found {len(assay_columns)} assay columns: "
+                f"{[(name, x) for name, x in assay_columns]}"
+            )
+            if example_header_x is not None:
+                self._debug_info.append(
+                    f"  Example column header at x={example_header_x}, y={example_header_y}"
+                )
+
+            # Determine the X range for example/compound IDs
+            # If we found an "Example"/"Compound" header, use its X position (±tolerance)
+            # Otherwise, fall back to left margin (x < 28% of width)
+            y_header_threshold = int(height * 0.12)
+
+            if example_header_x is not None:
+                # Use the Example header X position with tolerance
+                # The IDs are typically centered under or near the header
+                ex_x_min = max(0, example_header_x - 80)
+                ex_x_max = example_header_x + 100
+                # Table data starts below the header — skip anything above
+                # Use the header Y as the table start (with a small margin)
+                y_table_start = max(y_header_threshold, example_header_y + 20)
+            else:
+                # Fallback: left 28% of page
+                ex_x_min = 0
+                ex_x_max = int(width * 0.28)
+                y_table_start = y_header_threshold
+
+            self._debug_info.append(
+                f"  Example ID search range: x=[{ex_x_min}, {ex_x_max}], y>{y_table_start}"
             )
 
-            # Extract example numbers: digits in left margin (x < 28% of width)
-            # Skip the top 12% of the page (header area with page numbers)
-            x_left_threshold = int(width * 0.28)
-            y_header_threshold = int(height * 0.12)
             # Handles: "7", "100", "100-7", "100-11", "12a"
             example_pattern = re.compile(r'^(\d{1,4}(?:-\d{1,4})?[a-zA-Z]?)$')
             examples = []  # [(number_str, y_center)]
+            example_x_positions = []  # track actual X of example ID words
 
             for w in words:
-                if w['x'] > x_left_threshold or w['conf'] < 30:
+                if w['x'] < ex_x_min or w['x'] > ex_x_max or w['conf'] < 30:
                     continue
-                if w['y'] < y_header_threshold:
-                    continue  # Skip page header numbers
+                if w['y'] < y_table_start:
+                    continue  # Skip page header / text above table
 
                 text = w['text']
 
@@ -778,13 +907,13 @@ class BiologicalDataExtractor:
                 match = example_pattern.match(text)
 
                 # If no match, try OCR corrections for short texts only
-                # (avoid correcting words like "In" → "1n")
+                # (avoid correcting words like "In" -> "1n")
                 if not match and len(text) <= 6:
                     corrected_text = text
                     # Only replace i/l/I with 1 if adjacent to a digit
                     corrected_text = re.sub(r'(?<=\d)[ilI]', '1', corrected_text)
                     corrected_text = re.sub(r'[ilI](?=\d)', '1', corrected_text)
-                    # Also handle standalone "il" → "11" (two chars, both look like 1)
+                    # Also handle standalone "il" -> "11" (two chars, both look like 1)
                     if re.match(r'^[ilI]{1,4}$', text):
                         corrected_text = re.sub(r'[ilI]', '1', text)
                     corrected_text = re.sub(r'[O]', '0', corrected_text)
@@ -792,8 +921,9 @@ class BiologicalDataExtractor:
                 if match:
                     y_center = w['y'] + w['h'] // 2
                     examples.append((self._fix_ocr_compound_id(match.group(1)), y_center))
+                    example_x_positions.append(w['x'] + w['w'])
 
-            # Fix truncated compound IDs: "00-1" → "100-1" when "100" exists
+            # Fix truncated compound IDs: "00-1" -> "100-1" when "100" exists
             base_ids = [num for num, _ in examples if '-' not in num and len(num) >= 2]
             if base_ids:
                 longest_base = max(base_ids, key=len)  # e.g., "100"
@@ -813,6 +943,23 @@ class BiologicalDataExtractor:
             # If most IDs are in range [1-N], reject IDs that are >> N
             examples = self._filter_outlier_compound_ids(examples)
 
+            # Deduplicate: on two-column pages, the same compound ID may appear
+            # at two Y positions. Keep only the first occurrence of each ID to
+            # avoid the second (from a different column region) overwriting with
+            # a mismatched value.
+            seen_ids = set()
+            unique_examples = []
+            for ex_num, ex_y in examples:
+                if ex_num not in seen_ids:
+                    seen_ids.add(ex_num)
+                    unique_examples.append((ex_num, ex_y))
+            if len(unique_examples) < len(examples):
+                self._debug_info.append(
+                    f"  Deduplicated examples: {len(examples)} -> {len(unique_examples)} "
+                    f"(removed {len(examples) - len(unique_examples)} duplicates)"
+                )
+            examples = unique_examples
+
             self._debug_info.append(
                 f"  Found {len(examples)} example numbers: {[e[0] for e in examples]}"
             )
@@ -820,109 +967,108 @@ class BiologicalDataExtractor:
             if not examples:
                 return data
 
-            # Extract IC50/activity values near the assay column position
-            # If we know the header X, look within ±100px of it
-            # Otherwise, look in the right 50% of the page
-            if assay_header_x is not None:
-                val_x_min = assay_header_x - 50
-                val_x_max = assay_header_x + 150
-            else:
-                val_x_min = int(width * 0.50)
-                val_x_max = width
-
-            values = []  # [(value_str, y_center)]
-
-            for w in words:
-                if w['x'] < val_x_min or w['x'] > val_x_max:
-                    continue
-                if w['y'] < y_header_threshold:
-                    continue  # Skip page header area
-
-                text = w['text']
-
-                # Normalize + symbol OCR misreads
-                text = self._normalize_plus_symbols(text)
-
-                normalized_value = None
-
-                # OCR commonly reads "+" as "t", "++" as "tt", "+++" as "ttt"
-                # Only in the assay column area (x_pct > 40%)
-                if re.match(r'^[tT]+$', text) and w['x_pct'] > 40:
-                    t_count = len(text)
-                    normalized_value = '+' * t_count
-
-                # Mixed t/+ patterns (e.g., "t+" or "+t")
-                elif re.match(r'^[tT+＋]+$', text) and w['x_pct'] > 40 and len(text) <= 5:
-                    plus_count = sum(1 for c in text if c in 'tT+＋')
-                    normalized_value = '+' * plus_count
-
-                # Mixed +/4 patterns (e.g., "+444" → "++++")
-                elif re.match(r'^[+＋4]+$', text) and len(text) >= 2:
-                    normalized_value = '+' * len(text)
-
-                # Plus symbols
-                elif re.match(r'^[+＋]{1,5}$', text):
-                    normalized_value = '+' * (text.count('+') + text.count('＋'))
-
-                # Dash/minus (inactive)
-                elif re.match(r'^[-−–—]{1,5}$', text):
-                    normalized_value = '-'
-
-                # Numeric values with optional units (but NOT 4-digit page numbers)
-                elif re.match(r'^[<>≤≥]?\s*\d{1,3}\.?\d*\s*(?:nM|μM|uM|mM|pM|%)?$', text, re.IGNORECASE):
-                    normalized_value = text.strip()
-
-                # ND/NA/NT
-                elif text.upper() in ('ND', 'NA', 'NT'):
-                    normalized_value = text.upper()
-
-                # "He", "H+" etc. are OCR misreads of "++"
-                elif re.match(r'^[Hh][eE+]+$', text) and w['x_pct'] > 40:
-                    # "He" → "++", "H+" → "++"
-                    normalized_value = '++'
-
-                if normalized_value:
-                    y_center = w['y'] + w['h'] // 2
-                    values.append((normalized_value, y_center))
-
-            self._debug_info.append(
-                f"  Found {len(values)} assay values: {[v[0] for v in values]}"
-            )
-
-            if not values:
-                return data
-
-            # Match example numbers to values by Y-position proximity
-            y_tolerance = 100  # pixels at 200dpi (~1/3 inch)
-            used_values = set()
-
-            for ex_num, ex_y in examples:
-                best_val = None
-                best_dist = float('inf')
-                best_idx = -1
-
-                for val_idx, (val_str, val_y) in enumerate(values):
-                    if val_idx in used_values:
-                        continue
-                    dist = abs(ex_y - val_y)
-                    if dist < best_dist and dist < y_tolerance:
-                        best_dist = dist
-                        best_val = val_str
-                        best_idx = val_idx
-
-                if best_val is not None:
-                    used_values.add(best_idx)
-                    bio = BiologicalData(compound_id=ex_num)
-                    bio.other_assays[assay_name] = best_val
-                    if 'ic50' in assay_name.lower():
-                        bio.ic50 = best_val
-                    elif 'ec50' in assay_name.lower():
-                        bio.ec50 = best_val
-                    data[ex_num] = bio
+            # Auto-detect unnamed numeric columns when few named assay columns
+            # were found. This handles tables where column headers are enzyme
+            # names (e.g., KAT6a) rather than standard assay names.
+            if len(assay_columns) <= 1 and example_header_x is not None:
+                # Use the actual rightmost edge of example IDs (+ margin)
+                # as the boundary, instead of the generous ex_x_max
+                actual_ex_right = max(example_x_positions) + 30 if example_x_positions else ex_x_max
+                auto_cols = self._detect_numeric_columns(
+                    words, examples, assay_columns,
+                    actual_ex_right, y_table_start, width
+                )
+                if auto_cols:
                     self._debug_info.append(
-                        f"  Matched: Example {ex_num} (y={ex_y}) -> "
-                        f"{assay_name}={best_val} (dist={best_dist:.0f})"
+                        f"  Auto-detected {len(auto_cols)} unnamed numeric columns: "
+                        f"{[(n, x) for n, x in auto_cols]}"
                     )
+                    assay_columns = assay_columns + auto_cols
+                    assay_columns.sort(key=lambda ac: ac[1])
+
+            # For each assay column, extract values and match to examples by Y-position
+            for assay_name, assay_header_x in assay_columns:
+                # Determine X range for this column's values
+                # Find the next column's X to set the right boundary
+                col_idx = assay_columns.index((assay_name, assay_header_x))
+                if col_idx + 1 < len(assay_columns):
+                    next_col_x = assay_columns[col_idx + 1][1]
+                    val_x_max = assay_header_x + min(150, (next_col_x - assay_header_x) - 10)
+                else:
+                    val_x_max = assay_header_x + 150
+                val_x_min = assay_header_x - 50
+
+                values = []  # [(value_str, y_center)]
+
+                for w in words:
+                    if w['x'] < val_x_min or w['x'] > val_x_max:
+                        continue
+                    if w['y'] < y_header_threshold:
+                        continue  # Skip page header area
+
+                    text = w['text']
+
+                    # Normalize + symbol OCR misreads
+                    text = self._normalize_plus_symbols(text)
+
+                    normalized_value = self._normalize_ocr_assay_value(text, w['x_pct'])
+
+                    if normalized_value:
+                        y_center = w['y'] + w['h'] // 2
+                        values.append((normalized_value, y_center))
+
+                self._debug_info.append(
+                    f"  Column {assay_name} (x={assay_header_x}): "
+                    f"{len(values)} values: {[v[0] for v in values]}"
+                )
+
+                if not values:
+                    continue
+
+                # Match example numbers to values by Y-position proximity
+                y_tolerance = 100  # pixels at 200dpi (~1/3 inch)
+                used_values = set()
+
+                for ex_num, ex_y in examples:
+                    best_val = None
+                    best_dist = float('inf')
+                    best_idx = -1
+
+                    for val_idx, (val_str, val_y) in enumerate(values):
+                        if val_idx in used_values:
+                            continue
+                        dist = abs(ex_y - val_y)
+                        if dist < best_dist and dist < y_tolerance:
+                            best_dist = dist
+                            best_val = val_str
+                            best_idx = val_idx
+
+                    if best_val is not None:
+                        used_values.add(best_idx)
+
+                        if ex_num not in data:
+                            data[ex_num] = BiologicalData(compound_id=ex_num)
+
+                        bio = data[ex_num]
+                        # Only set if not already populated (avoid overwrites
+                        # from duplicate IDs on two-column pages)
+                        if assay_name not in bio.other_assays:
+                            bio.other_assays[assay_name] = best_val
+
+                        # Also set legacy fields for the first match of each type
+                        if 'ic50' in assay_name.lower() and not bio.ic50:
+                            bio.ic50 = best_val
+                        elif 'ec50' in assay_name.lower() and not bio.ec50:
+                            bio.ec50 = best_val
+                        elif assay_name.lower() == 'ki' and not bio.ki:
+                            bio.ki = best_val
+                        elif assay_name.lower() == 'kd' and not bio.kd:
+                            bio.kd = best_val
+
+                        self._debug_info.append(
+                            f"  Matched: Example {ex_num} (y={ex_y}) -> "
+                            f"{assay_name}={best_val} (dist={best_dist:.0f})"
+                        )
 
             self._debug_info.append(
                 f"  Patent table columns: extracted {len(data)} compounds on page {page_num}"
@@ -932,6 +1078,124 @@ class BiologicalDataExtractor:
             self._debug_info.append(f"  Patent table columns error: {e}")
 
         return data
+
+    def _detect_numeric_columns(
+        self,
+        words: list,
+        examples: list,
+        existing_assay_columns: list,
+        ex_x_max: int,
+        y_table_start: int,
+        page_width: int,
+    ) -> list:
+        """Detect unnamed columns of numeric data aligned with compound IDs.
+
+        Scans for clusters of numeric/assay-like values at consistent X
+        positions to the right of the example ID column, excluding positions
+        already covered by named assay columns.
+
+        Returns list of (column_name, x_position) tuples.
+        """
+        existing_x_positions = {x for _, x in existing_assay_columns}
+
+        # Collect numeric-like words in the data area (right of example IDs)
+        numeric_words = []
+        for w in words:
+            if w['x'] <= ex_x_max or w['y'] < y_table_start:
+                continue
+            # Skip words already covered by existing columns
+            skip = False
+            for _, ex_x in existing_assay_columns:
+                if abs(w['x'] - ex_x) < 60:
+                    skip = True
+                    break
+            if skip:
+                continue
+
+            text = w['text']
+            normalized = self._normalize_ocr_assay_value(text, w['x_pct'])
+            if normalized:
+                numeric_words.append(w)
+
+        if len(numeric_words) < 3:
+            return []
+
+        # Cluster by X position (within 40px tolerance)
+        # Sort by X, then group adjacent words
+        numeric_words.sort(key=lambda w: w['x'])
+        clusters = []  # [(center_x, count)]
+        current_cluster_x = numeric_words[0]['x']
+        current_count = 1
+        current_sum_x = numeric_words[0]['x']
+
+        for w in numeric_words[1:]:
+            if w['x'] - current_cluster_x < 40:
+                current_count += 1
+                current_sum_x += w['x']
+            else:
+                if current_count >= 3:
+                    clusters.append((current_sum_x // current_count, current_count))
+                current_cluster_x = w['x']
+                current_count = 1
+                current_sum_x = w['x']
+
+        if current_count >= 3:
+            clusters.append((current_sum_x // current_count, current_count))
+
+        # Filter: only keep clusters with enough values (at least 30% of examples)
+        min_values = max(3, len(examples) * 0.3)
+        result = []
+        for center_x, count in clusters:
+            if count >= min_values:
+                # Check not too close to existing columns
+                too_close = any(abs(center_x - ex_x) < 60 for _, ex_x in existing_assay_columns)
+                if not too_close:
+                    col_name = f"Assay_{len(result) + 1}"
+                    result.append((col_name, center_x))
+
+        return result
+
+    def _normalize_ocr_assay_value(self, text: str, x_pct: float) -> Optional[str]:
+        """Normalize an OCR-read assay value. Returns normalized string or None."""
+        # OCR commonly reads "+" as "t", "++" as "tt", "+++" as "ttt"
+        # Only in the assay column area (x_pct > 40%)
+        if re.match(r'^[tT]+$', text) and x_pct > 40:
+            return '+' * len(text)
+
+        # Mixed t/+ patterns (e.g., "t+" or "+t")
+        if re.match(r'^[tT+\uff0b]+$', text) and x_pct > 40 and len(text) <= 5:
+            plus_count = sum(1 for c in text if c in 'tT+\uff0b')
+            return '+' * plus_count
+
+        # Mixed +/4 patterns (e.g., "+444" -> "++++")
+        if re.match(r'^[+\uff0b4]+$', text) and len(text) >= 2:
+            return '+' * len(text)
+
+        # Plus symbols
+        if re.match(r'^[+\uff0b]{1,5}$', text):
+            return '+' * (text.count('+') + text.count('\uff0b'))
+
+        # Dash/minus (inactive)
+        if re.match(r'^[-\u2212\u2013\u2014]{1,5}$', text):
+            return '-'
+
+        # Numeric values with optional units (but NOT 4-digit page numbers)
+        if re.match(r'^[<>\u2264\u2265]?\s*\d{1,3}\.?\d*\s*(?:nM|\u03bcM|uM|mM|pM|%)?$', text, re.IGNORECASE):
+            return text.strip()
+
+        # ND/NA/NT
+        if text.upper() in ('ND', 'NA', 'NT'):
+            return text.upper()
+
+        # Single-letter potency grades (A, B, C, D) in the assay area
+        if text.upper() in ('A', 'B', 'C', 'D') and x_pct > 50:
+            return text.upper()
+
+        # "He", "H+" etc. are OCR misreads of "++"
+        if re.match(r'^[Hh][eE+]+$', text) and x_pct > 40:
+            return '++'
+
+        return None
 
     def _extract_from_page_ocr(self, pdfium_page, page_num: int) -> Dict[str, BiologicalData]:
         """Extract biological data using OCR on page image."""
@@ -950,26 +1214,31 @@ class BiologicalDataExtractor:
             width, height = pil_image.size
             self._debug_info.append(f"  Page image size: {width}x{height}")
 
-            # Try targeted patent table column extraction first
-            # This handles the common patent layout: Example | Structure (image) | IC50
+            # Try both patent table column extraction and structured OCR,
+            # then pick the result with better assay coverage per compound.
+            ptc_data = {}
+            struct_data = {}
+
             self._debug_info.append(f"  Trying patent table column extraction on page {page_num}...")
             try:
-                data = self._extract_patent_table_columns(pil_image, page_num)
-                if data:
-                    self._debug_info.append(f"  Patent table columns found {len(data)} compounds")
-                    return data
+                ptc_data = self._extract_patent_table_columns(pil_image, page_num)
+                if ptc_data:
+                    self._debug_info.append(f"  Patent table columns found {len(ptc_data)} compounds")
             except Exception as e:
                 self._debug_info.append(f"  Patent table columns failed: {e}")
 
-            # Try structured OCR (preserves table layout)
             self._debug_info.append(f"  Running structured OCR on page {page_num}...")
             try:
-                data = self._extract_table_from_ocr(pil_image, page_num)
-                if data:
-                    self._debug_info.append(f"  Structured OCR found {len(data)} compounds")
-                    return data
+                struct_data = self._extract_table_from_ocr(pil_image, page_num)
+                if struct_data:
+                    self._debug_info.append(f"  Structured OCR found {len(struct_data)} compounds")
             except Exception as e:
                 self._debug_info.append(f"  Structured OCR failed: {e}")
+
+            # Pick the better result: compare average assay columns per compound
+            data = self._pick_better_ocr_result(ptc_data, struct_data)
+            if data:
+                return data
 
             # Fallback: Run OCR on full page
             self._debug_info.append(f"  Running text OCR on full page {page_num}...")
@@ -1011,6 +1280,86 @@ class BiologicalDataExtractor:
             self._debug_info.append(f"  OCR extraction error: {e}")
 
         return data
+
+    @staticmethod
+    def _avg_assay_columns(data: Dict[str, 'BiologicalData']) -> float:
+        """Return the average number of populated assay fields per compound."""
+        if not data:
+            return 0.0
+        total = 0
+        for bio in data.values():
+            count = 0
+            if bio.ic50:
+                count += 1
+            if bio.ec50:
+                count += 1
+            if bio.ki:
+                count += 1
+            if bio.kd:
+                count += 1
+            if bio.other_assays:
+                count += len(bio.other_assays)
+            total += count
+        return total / len(data)
+
+    def _pick_better_ocr_result(
+        self,
+        ptc_data: Dict[str, 'BiologicalData'],
+        struct_data: Dict[str, 'BiologicalData'],
+    ) -> Dict[str, 'BiologicalData']:
+        """Pick the better result between patent-table-columns and structured OCR.
+
+        Prefers the result with more total assay data (compounds × avg columns).
+        If both have data, merges: takes the better one as base and fills gaps
+        from the other.
+        """
+        if not ptc_data and not struct_data:
+            return {}
+        if not struct_data:
+            self._debug_info.append("  OCR pick: using patent-table-columns (no structured OCR data)")
+            return ptc_data
+        if not ptc_data:
+            self._debug_info.append("  OCR pick: using structured OCR (no patent-table-columns data)")
+            return struct_data
+
+        ptc_avg = self._avg_assay_columns(ptc_data)
+        struct_avg = self._avg_assay_columns(struct_data)
+        ptc_score = len(ptc_data) * ptc_avg
+        struct_score = len(struct_data) * struct_avg
+
+        self._debug_info.append(
+            f"  OCR comparison: patent-table-columns {len(ptc_data)} cpds × {ptc_avg:.1f} cols = {ptc_score:.1f} "
+            f"vs structured OCR {len(struct_data)} cpds × {struct_avg:.1f} cols = {struct_score:.1f}"
+        )
+
+        # Pick the one with higher total score
+        if struct_score > ptc_score:
+            base, supplement = struct_data, ptc_data
+            self._debug_info.append("  OCR pick: structured OCR (better coverage)")
+        else:
+            base, supplement = ptc_data, struct_data
+            self._debug_info.append("  OCR pick: patent-table-columns (better coverage)")
+
+        # Merge: fill gaps in base from supplement
+        for cid, bio in supplement.items():
+            if cid not in base:
+                base[cid] = bio
+            else:
+                existing = base[cid]
+                if not existing.ic50 and bio.ic50:
+                    existing.ic50 = bio.ic50
+                if not existing.ec50 and bio.ec50:
+                    existing.ec50 = bio.ec50
+                if not existing.ki and bio.ki:
+                    existing.ki = bio.ki
+                if not existing.kd and bio.kd:
+                    existing.kd = bio.kd
+                if bio.other_assays:
+                    for k, v in bio.other_assays.items():
+                        if k not in existing.other_assays:
+                            existing.other_assays[k] = v
+
+        return base
 
     def _extract_table_from_ocr(self, pil_image, page_num: int) -> Dict[str, BiologicalData]:
         """Extract table data using OCR with layout preservation."""
@@ -2226,6 +2575,12 @@ class BiologicalDataExtractor:
 
         return mapping
 
+    # Patterns for common compound ID prefixes in patent tables
+    _COMPOUND_PREFIX_RE = re.compile(
+        r'^(?:Example|Compound|Cpd\.?|Cmpd\.?|Ex\.?|No\.?|#)\s*',
+        re.IGNORECASE,
+    )
+
     def _extract_compound_id(self, row: List, col_idx: int) -> Optional[str]:
         """Extract compound ID from a table row."""
         if col_idx >= len(row):
@@ -2239,12 +2594,19 @@ class BiologicalDataExtractor:
         if not cell_text:
             return None
 
+        # Strip common prefixes: "Example 7" -> "7", "Cpd. 12a" -> "12a"
+        stripped = self._COMPOUND_PREFIX_RE.sub('', cell_text).strip()
+        if stripped:
+            cell_text = stripped
+
         match = self.COMPOUND_ID_PATTERN.search(cell_text)
         if match:
             return match.group(1)
 
+        # Tighter fallback: require at least one digit (avoids false IDs from
+        # random text like "Structure" or "Activity")
         cleaned = re.sub(r'[^\w]', '', cell_text)
-        if len(cleaned) <= 10 and cleaned:
+        if len(cleaned) <= 10 and cleaned and re.search(r'\d', cleaned):
             return cleaned
 
         return None

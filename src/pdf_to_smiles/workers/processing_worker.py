@@ -669,6 +669,27 @@ class ProcessingWorker(QThread):
         )
         self.progress_updated.emit(progress)
 
+    @staticmethod
+    def _normalize_compound_id_for_merge(raw_id: str) -> str:
+        """Normalize a compound ID for merge matching.
+
+        Strips common prefixes like "Example", "Compound", "Cpd.", "Ex." and
+        removes leading zeros so that "007" matches "7".
+        """
+        import re
+        normalized = raw_id.strip()
+        # Strip common prefixes
+        normalized = re.sub(
+            r'^(?:Example|Compound|Cpd\.?|Cmpd\.?|Ex\.?|No\.?|#)\s*',
+            '', normalized, flags=re.IGNORECASE,
+        ).strip()
+        # Strip leading zeros from purely numeric IDs: "007" -> "7"
+        # But preserve compound IDs like "007a" or "00-7"
+        m = re.match(r'^0+(\d+)$', normalized)
+        if m:
+            normalized = m.group(1)
+        return normalized
+
     def _merge_biological_data(
         self,
         results: List[ExtractionResult],
@@ -705,7 +726,12 @@ class ProcessingWorker(QThread):
                 result_ids.append(f"{r.compound_id}(src={r.source_file})")
         debug_info.append(f"Result compound IDs: {result_ids[:15]}")
 
-        # Create a set of all bio_data keys for fuzzy matching
+        # Build normalized lookup for bio_data keys
+        # Maps normalized_id -> original_key for faster matching
+        bio_normalized = {}
+        for key in bio_data:
+            norm = self._normalize_compound_id_for_merge(key)
+            bio_normalized[norm] = key
         bio_data_keys = set(bio_data.keys())
 
         for result in results:
@@ -718,11 +744,15 @@ class ProcessingWorker(QThread):
 
             # Normalize compound ID for matching
             compound_id = result.compound_id.strip()
+            norm_compound_id = self._normalize_compound_id_for_merge(compound_id)
             matched_key = None
 
             # Try exact match first
             if compound_id in bio_data:
                 matched_key = compound_id
+            # Try normalized match (handles "Example 7" vs "7", leading zeros, etc.)
+            elif norm_compound_id in bio_normalized:
+                matched_key = bio_normalized[norm_compound_id]
             else:
                 # Try case-insensitive exact match
                 for key in bio_data_keys:
@@ -730,32 +760,46 @@ class ProcessingWorker(QThread):
                         matched_key = key
                         break
 
+                # Try case-insensitive normalized match
+                if not matched_key:
+                    norm_lower = norm_compound_id.lower()
+                    for norm_key, orig_key in bio_normalized.items():
+                        if norm_key.lower() == norm_lower:
+                            matched_key = orig_key
+                            break
+
                 # Try matching just the numeric/alphanumeric part
                 if not matched_key:
-                    # Extract full ID including dash: "100-7" → "100-7", "12a" → "12a"
-                    match = re.search(r'(\d+(?:-\d+)?[a-zA-Z]?)', compound_id)
+                    # Extract full ID including dash: "100-7" -> "100-7", "12a" -> "12a"
+                    match = re.search(r'(\d+(?:-\d+)?[a-zA-Z]?)', norm_compound_id)
                     if match:
                         simple_id = match.group(1)
                         if simple_id in bio_data:
                             matched_key = simple_id
+                        elif simple_id in bio_normalized:
+                            matched_key = bio_normalized[simple_id]
                         else:
-                            # Fuzzy match: compare IDs
+                            # Fuzzy match: compare extracted numeric parts
                             for key in bio_data_keys:
-                                key_simple = re.search(r'(\d+(?:-\d+)?[a-zA-Z]?)', key)
+                                key_norm = self._normalize_compound_id_for_merge(key)
+                                key_simple = re.search(r'(\d+(?:-\d+)?[a-zA-Z]?)', key_norm)
                                 if key_simple and key_simple.group(1) == simple_id:
                                     matched_key = key
                                     break
 
                             # Last resort: compare just the numeric base
                             if not matched_key:
-                                base_match = re.match(r'(\d+)', compound_id)
+                                base_match = re.match(r'(\d+)', norm_compound_id)
                                 if base_match:
-                                    base_num = base_match.group(1)
+                                    base_num = base_match.group(1).lstrip('0') or '0'
                                     for key in bio_data_keys:
-                                        key_base = re.match(r'(\d+)', key)
-                                        if key_base and key_base.group(1) == base_num and '-' not in key and '-' not in compound_id:
-                                            matched_key = key
-                                            break
+                                        key_norm = self._normalize_compound_id_for_merge(key)
+                                        key_base = re.match(r'(\d+)', key_norm)
+                                        if key_base:
+                                            key_base_num = key_base.group(1).lstrip('0') or '0'
+                                            if key_base_num == base_num and '-' not in key_norm and '-' not in norm_compound_id:
+                                                matched_key = key
+                                                break
 
             if matched_key:
                 data = bio_data[matched_key]
@@ -777,6 +821,17 @@ class ProcessingWorker(QThread):
                 data.matched = True
             else:
                 debug_info.append(f"  NOT MATCHED: {compound_id} (source={result.source_file})")
+
+        # Log unmatched bio data compounds (extracted but not matched to structures)
+        unmatched_bio = []
+        for key, bd in bio_data.items():
+            if not bd.matched:
+                assays = list(bd.other_assays.items())[:3]
+                unmatched_bio.append(f"{key}: {assays}")
+        if unmatched_bio:
+            debug_info.append(f"  UNMATCHED BIO DATA ({len(unmatched_bio)} compounds):")
+            for entry in unmatched_bio[:20]:
+                debug_info.append(f"    {entry}")
 
         # Add debug info to the extractor's log
         debug_info.append(f"Total merged: {merge_count}")

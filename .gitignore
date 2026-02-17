@@ -16,3 +16,18 @@ build/
 *.zip
 Output/
 run_build.bat
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+*.log

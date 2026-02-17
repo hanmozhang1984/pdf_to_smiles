@@ -1,5 +1,6 @@
 @echo off
-cd /d C:\Users\HanmoZhang\Documents\Projects\todo\pdf_to_smiles\src
-call ..\venv\Scripts\activate.bat
-python -m pdf_to_smiles.main
+REM Launch PDF to SMILES on Windows
+cd /d "%~dp0"
+call venv\Scripts\activate.bat
+python -m pdf_to_smiles
 pause

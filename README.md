@@ -84,6 +84,20 @@ If you use this software in academic work, please cite the DECIMER papers:
 
 > Rajan, K., Brinkhaus, H.O., Sorokina, M. et al. DECIMER.ai: an open platform for automated optical chemical structure identification, segmentation and recognition in scientific publications. *Nat Commun* 14, 5045 (2023). https://doi.org/10.1038/s41467-023-40782-0
 
+## Improvement Roadmap
+
+We are actively working on improving extraction accuracy toward the ~90% practical threshold. Development is organized into five parallel feature branches, all forked from the `v1.1.0-biodata-fix` baseline tag.
+
+| Priority | Feature | Branch | Status |
+|----------|---------|--------|--------|
+| P1 | LLM compound classification (Claude Haiku) | `feature/llm-compound-classification` | Planned |
+| P2 | Text cleanup (connected component analysis) | `feature/text-cleanup` | Planned |
+| P3 | LLM page layout (Claude Vision prototype) | `feature/llm-page-layout` | Planned |
+| P4 | PaddleOCR text masking + inpainting | `feature/paddleocr-text-masking` | Planned |
+| P5 | LayoutLMv3 fine-tuning pipeline | `feature/layoutlm-finetuning` | Planned |
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details on the branching strategy, architecture, and how to get involved.
+
 ## Building Standalone Executables
 
 To create a standalone executable that includes Tesseract OCR:

@@ -49,6 +49,9 @@ class SMILESPredictor:
             - Accuracy is ~96% for clean, well-rendered structures
             - Stereochemistry may not be correctly predicted
         """
+        from pdf_to_smiles.core.image_cleaner import clean_structure_image
+        structure_image = clean_structure_image(structure_image)
+
         self._ensure_initialized()
 
         if high_accuracy:

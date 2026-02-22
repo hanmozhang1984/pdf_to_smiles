@@ -101,6 +101,9 @@ class LightweightPredictor:
         Returns:
             Predicted SMILES string, or None if prediction fails.
         """
+        from pdf_to_smiles.core.image_cleaner import clean_structure_image
+        structure_image = clean_structure_image(structure_image)
+
         self._ensure_initialized()
 
         try:
@@ -146,6 +149,9 @@ class LightweightPredictor:
         Returns:
             List of predicted SMILES strings (None for failed predictions).
         """
+        from pdf_to_smiles.core.image_cleaner import clean_structure_image
+        structure_images = [clean_structure_image(img) for img in structure_images]
+
         self._ensure_initialized()
 
         try:

@@ -50,6 +50,9 @@ decimer = [
     "decimer-segmentation>=1.4.0",
     "tensorflow>=2.15.0",
 ]
+layout = [
+    "doclayout-yolo>=0.1.0",
+]
 dev = [
     "pyinstaller>=6.0.0",
     "pytest>=7.0.0",

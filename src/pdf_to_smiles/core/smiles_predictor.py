@@ -15,14 +15,23 @@ class SMILESPredictor:
     Uses the DECIMER deep learning model to convert structure images to SMILES.
     """
 
-    def __init__(self):
+    def __init__(self, mask_text: bool | None = None):
         """Initialize the SMILES predictor.
+
+        Args:
+            mask_text: If True, use PaddleOCR to mask non-structural text before
+                prediction. If None (default), auto-detect PaddleOCR availability.
 
         Note: Model loading is deferred to first prediction to avoid slow startup.
         The first prediction will take longer (~30-60s) due to model loading.
         """
         self._predict_smiles = None
         self._initialized = False
+        if mask_text is None:
+            from pdf_to_smiles.core.text_masker import is_available as _text_masker_available
+            self._mask_text = _text_masker_available()
+        else:
+            self._mask_text = mask_text
 
     def _ensure_initialized(self) -> None:
         """Lazy initialization of DECIMER model."""
@@ -50,7 +59,7 @@ class SMILESPredictor:
             - Stereochemistry may not be correctly predicted
         """
         from pdf_to_smiles.core.image_cleaner import clean_structure_image
-        structure_image = clean_structure_image(structure_image)
+        structure_image = clean_structure_image(structure_image, mask_text=self._mask_text)
 
         self._ensure_initialized()
 

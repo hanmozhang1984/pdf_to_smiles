@@ -257,8 +257,8 @@ class ProcessingWorker(QThread):
                         f"File {file_num}/{total_files}: Scanning pages for structures..."
                     )
                     try:
-                        from ..core.page_classifier import PageClassifier
-                        classifier = PageClassifier()
+                        from ..core.page_classifier import get_classifier
+                        classifier = get_classifier()
 
                         def scan_progress(current, total):
                             if self._is_cancelled():

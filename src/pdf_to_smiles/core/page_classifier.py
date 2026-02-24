@@ -10,6 +10,19 @@ import pypdfium2 as pdfium
 from PIL import Image
 
 
+def get_classifier():
+    """Return the best available page classifier.
+
+    Prefers DocLayout-YOLO (~90%+ accuracy) if doclayout_yolo is installed,
+    falls back to heuristic PageClassifier (~59% accuracy).
+    """
+    try:
+        from .doclayout_classifier import DocLayoutClassifier
+        return DocLayoutClassifier()
+    except ImportError:
+        return PageClassifier()
+
+
 class PageClassifier:
     """Classify PDF pages by visual content using low-resolution pixel analysis."""
 

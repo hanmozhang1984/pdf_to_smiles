@@ -16,10 +16,13 @@ import numpy as np
 from PIL import Image
 
 
-def clean_structure_image(image: Image.Image) -> Image.Image:
+def clean_structure_image(image: Image.Image, mask_text: bool = False) -> Image.Image:
     """Remove contaminating elements from a chemical structure image.
 
-    Two-pass strategy:
+    Multi-pass strategy:
+    Pass 0 (optional) — Use PaddleOCR to detect and white-fill non-structural
+             text (compound names, captions, step labels) while preserving
+             atom labels. Only runs when *mask_text* is True.
     Pass 1 — Remove long straight lines (table borders, separator lines).
              Detected via morphological line kernels. No molecular bond spans
              >50% of the image width/height, so this is safe.
@@ -30,10 +33,16 @@ def clean_structure_image(image: Image.Image) -> Image.Image:
 
     Args:
         image: PIL Image of a cropped chemical structure.
+        mask_text: If True, run PaddleOCR text masking before line removal.
 
     Returns:
         Cleaned PIL Image with contaminants white-filled.
     """
+    # --- Pass 0 (optional): Text masking via PaddleOCR ---
+    if mask_text:
+        from pdf_to_smiles.core.text_masker import mask_text_regions
+        image = mask_text_regions(image)
+
     if image.mode != 'RGB':
         image = image.convert('RGB')
 

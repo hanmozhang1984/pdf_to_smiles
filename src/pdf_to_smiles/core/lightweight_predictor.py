@@ -20,9 +20,14 @@ class LightweightPredictor:
     of DECIMER (TensorFlow). Lighter weight and faster on CPU.
     """
 
-    def __init__(self):
+    def __init__(self, mask_text: bool | None = None):
         self._model = None
         self._initialized = False
+        if mask_text is None:
+            from pdf_to_smiles.core.text_masker import is_available as _text_masker_available
+            self._mask_text = _text_masker_available()
+        else:
+            self._mask_text = mask_text
 
     # HuggingFace repo and default checkpoint for MolScribe
     _HF_REPO = "yujieq/MolScribe"
@@ -102,7 +107,7 @@ class LightweightPredictor:
             Predicted SMILES string, or None if prediction fails.
         """
         from pdf_to_smiles.core.image_cleaner import clean_structure_image
-        structure_image = clean_structure_image(structure_image)
+        structure_image = clean_structure_image(structure_image, mask_text=self._mask_text)
 
         self._ensure_initialized()
 
@@ -150,7 +155,7 @@ class LightweightPredictor:
             List of predicted SMILES strings (None for failed predictions).
         """
         from pdf_to_smiles.core.image_cleaner import clean_structure_image
-        structure_images = [clean_structure_image(img) for img in structure_images]
+        structure_images = [clean_structure_image(img, mask_text=self._mask_text) for img in structure_images]
 
         self._ensure_initialized()
 

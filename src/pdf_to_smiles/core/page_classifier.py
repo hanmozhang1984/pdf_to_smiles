@@ -13,13 +13,30 @@ from PIL import Image
 def get_classifier():
     """Return the best available page classifier.
 
-    Prefers DocLayout-YOLO (~90%+ accuracy) if doclayout_yolo is installed,
-    falls back to heuristic PageClassifier (~59% accuracy).
+    Priority chain:
+    1. Hybrid (YOLO + Claude Vision verification) -- best accuracy
+    2. DocLayout-YOLO standalone -- good accuracy, free
+    3. Heuristic PageClassifier -- basic fallback
     """
     try:
         from .doclayout_classifier import DocLayoutClassifier
-        return DocLayoutClassifier()
+        yolo_available = True
     except ImportError:
+        yolo_available = False
+
+    try:
+        from .llm_layout_analyzer import is_available as llm_available
+        llm_ok = llm_available()
+    except ImportError:
+        llm_ok = False
+
+    if yolo_available and llm_ok:
+        from .hybrid_classifier import HybridClassifier
+        return HybridClassifier()
+    elif yolo_available:
+        from .doclayout_classifier import DocLayoutClassifier
+        return DocLayoutClassifier()
+    else:
         return PageClassifier()
 
 

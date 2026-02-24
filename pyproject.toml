@@ -57,6 +57,9 @@ textmask = [
     "paddleocr>=2.7.0",
     "paddlepaddle>=2.5.0",
 ]
+vision = [
+    "anthropic>=0.39.0",
+]
 dev = [
     "pyinstaller>=6.0.0",
     "pytest>=7.0.0",

@@ -41,10 +41,10 @@ class LightweightDetector:
     MAX_FILL_RATIO = 0.45     # Text blocks are very dense; structures are sparser
     MIN_FILL_RATIO = 0.005    # Too sparse = noise
     MAX_PAGE_WIDTH_RATIO = 0.50  # Skip regions spanning >50% of page width
-    TEXT_FILL_THRESHOLD = 0.10   # Fill above this + text lines → likely text block
+    TEXT_FILL_THRESHOLD = 0.15   # Fill above this + text lines → likely text block
 
     # Text line detection thresholds
-    MAX_TEXT_LINES = 3         # Reject regions with more text lines than this
+    MAX_TEXT_LINES = 5         # Reject regions with more text lines than this
     TEXT_LINE_THRESHOLD = 0.15 # Row dark pixel ratio to count as text line
     TEXT_LINE_GAP_MIN = 5      # Min gap rows between distinct text lines
 

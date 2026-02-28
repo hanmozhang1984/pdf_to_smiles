@@ -51,7 +51,7 @@ decimer = [
     "tensorflow>=2.15.0",
 ]
 layout = [
-    "doclayout-yolo>=0.1.0",
+    "docling>=2.0.0",
 ]
 textmask = [
     "paddleocr>=2.7.0",

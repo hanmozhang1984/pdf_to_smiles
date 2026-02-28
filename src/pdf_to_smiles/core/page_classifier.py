@@ -14,15 +14,15 @@ def get_classifier():
     """Return the best available page classifier.
 
     Priority chain:
-    1. Hybrid (YOLO + Claude Vision verification) -- best accuracy
-    2. DocLayout-YOLO standalone -- good accuracy, free
+    1. Hybrid (Docling + Claude Vision verification) -- best accuracy
+    2. Docling standalone -- good accuracy, free, Apache 2.0
     3. Heuristic PageClassifier -- basic fallback
     """
     try:
-        from .doclayout_classifier import DocLayoutClassifier
-        yolo_available = True
+        from .docling_classifier import DoclingClassifier
+        docling_available = True
     except ImportError:
-        yolo_available = False
+        docling_available = False
 
     try:
         from .llm_layout_analyzer import is_available as llm_available
@@ -30,12 +30,12 @@ def get_classifier():
     except ImportError:
         llm_ok = False
 
-    if yolo_available and llm_ok:
+    if docling_available and llm_ok:
         from .hybrid_classifier import HybridClassifier
         return HybridClassifier()
-    elif yolo_available:
-        from .doclayout_classifier import DocLayoutClassifier
-        return DocLayoutClassifier()
+    elif docling_available:
+        from .docling_classifier import DoclingClassifier
+        return DoclingClassifier()
     else:
         return PageClassifier()
 
@@ -139,6 +139,70 @@ class PageClassifier:
                     structure_strips += 1
 
         return structure_strips >= self.MIN_STRUCTURE_STRIPS
+
+    def _has_dense_structure_region(self, pil_image: Image.Image) -> bool:
+        """Check if page has dense localized regions characteristic of chemical structures.
+
+        Designed for rescue pass context: detects structures embedded in dense text
+        that spread-based analysis can't distinguish from text columns.
+
+        Uses cell-based density analysis — divides the page into a grid of small
+        cells and looks for cells with high dark pixel density. Chemical structures
+        have thick lines (bonds, rings) creating cells with >30% density, while text
+        cells stay under ~28%. Also checks for vertical adjacency of moderately dense
+        cells (>22%), indicating a 2D structure region rather than a 1D text line.
+
+        Criterion: (vertically_clustered_cells >= 4) OR (max_cell_density > 0.35)
+        """
+        import numpy as np
+
+        CELL_SIZE = 20
+        DENSE_THRESHOLD = 0.22
+        MAX_DENSITY_THRESHOLD = 0.35
+        MIN_VERT_CLUSTERED = 4
+
+        gray = pil_image.convert('L')
+        arr = np.array(gray)
+        height, width = arr.shape
+
+        # Skip margins
+        x_start = int(width * 0.05)
+        x_end = int(width * 0.95)
+        y_start = int(height * 0.08)
+        y_end = int(height * 0.92)
+
+        dark = (arr[y_start:y_end, x_start:x_end] < self.DARK_THRESHOLD).astype(np.float32)
+
+        n_rows = (dark.shape[0] - CELL_SIZE) // CELL_SIZE + 1
+        n_cols = (dark.shape[1] - CELL_SIZE) // CELL_SIZE + 1
+
+        if n_rows < 2 or n_cols < 2:
+            return False
+
+        # Build density grid
+        grid = np.zeros((n_rows, n_cols))
+        for r in range(n_rows):
+            for c in range(n_cols):
+                cy = r * CELL_SIZE
+                cx = c * CELL_SIZE
+                grid[r, c] = dark[cy:cy+CELL_SIZE, cx:cx+CELL_SIZE].mean()
+
+        # A single very dense cell indicates a structure (thick lines/bonds)
+        if grid.max() > MAX_DENSITY_THRESHOLD:
+            return True
+
+        # Check for vertical adjacency of moderately dense cells —
+        # structures span multiple cell rows (2D), text headers don't
+        dense = grid > DENSE_THRESHOLD
+        vert_clustered = 0
+        for r in range(n_rows):
+            for c in range(n_cols):
+                if not dense[r, c]:
+                    continue
+                if (r > 0 and dense[r-1, c]) or (r < n_rows - 1 and dense[r+1, c]):
+                    vert_clustered += 1
+
+        return vert_clustered >= MIN_VERT_CLUSTERED
 
     def _has_bio_table_indicators(self, pil_image: Image.Image) -> bool:
         """Check if page has tabular layout (potential bio data table).

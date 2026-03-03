@@ -208,7 +208,7 @@ class MainWindow(QMainWindow):
         self._results: List[ExtractionResult] = []
         self._worker: Optional[ProcessingWorker] = None
         self._custom_columns: List[str] = []  # Track custom column names
-        self._base_column_count = 14  # Number of built-in columns (without bio data columns)
+        self._base_column_count = 15  # Number of built-in columns (without bio data columns)
         self._bio_columns: List[str] = []  # Track dynamic bio data column names
         self._custom_column_data: dict = {}  # Store custom column values by (row, col_name)
         self._last_bio_data: dict = {}  # Store last extracted bio data for unmatched display
@@ -516,9 +516,9 @@ class MainWindow(QMainWindow):
 
         # Results table - base columns only (bio data columns added dynamically)
         self._table = QTableWidget()
-        self._table.setColumnCount(14)
+        self._table.setColumnCount(15)
         self._table.setHorizontalHeaderLabels([
-            "", "Source", "Compound", "Page", "Original", "SMILES", "Valid", "RDKit Rendering",
+            "", "Source", "Compound", "Type", "Page", "Original", "SMILES", "Valid", "RDKit Rendering",
             "MW (Da)", "cLogP", "TPSA", "Rot. Bonds", "Stereo", "Formula"
         ])
 
@@ -536,17 +536,18 @@ class MainWindow(QMainWindow):
         self._table.setColumnWidth(0, 30)   # Checkbox
         self._table.setColumnWidth(1, 120)  # Source
         self._table.setColumnWidth(2, 100)  # Compound
-        self._table.setColumnWidth(3, 50)   # Page
-        self._table.setColumnWidth(4, 150)  # Original image
-        self._table.setColumnWidth(5, 200)  # SMILES
-        self._table.setColumnWidth(6, 50)   # Valid
-        self._table.setColumnWidth(7, 150)  # RDKit image
-        self._table.setColumnWidth(8, 70)   # MW
-        self._table.setColumnWidth(9, 60)   # cLogP
-        self._table.setColumnWidth(10, 60)  # TPSA
-        self._table.setColumnWidth(11, 80)  # Rot. Bonds
-        self._table.setColumnWidth(12, 55)  # Stereo
-        # Column 13 (Formula) stretches to fill remaining space initially
+        self._table.setColumnWidth(3, 70)   # Type
+        self._table.setColumnWidth(4, 50)   # Page
+        self._table.setColumnWidth(5, 150)  # Original image
+        self._table.setColumnWidth(6, 200)  # SMILES
+        self._table.setColumnWidth(7, 50)   # Valid
+        self._table.setColumnWidth(8, 150)  # RDKit image
+        self._table.setColumnWidth(9, 70)   # MW
+        self._table.setColumnWidth(10, 60)  # cLogP
+        self._table.setColumnWidth(11, 60)  # TPSA
+        self._table.setColumnWidth(12, 80)  # Rot. Bonds
+        self._table.setColumnWidth(13, 55)  # Stereo
+        # Column 14 (Formula) stretches to fill remaining space initially
         # Bio data columns are added dynamically after processing
 
         # Enable row resizing by mouse drag
@@ -698,82 +699,93 @@ class MainWindow(QMainWindow):
             compound_item.setToolTip(result.compound_id)
         self._table.setItem(row, 2, compound_item)
 
-        # Page number (numeric sort) - column 3
+        # Compound Type - column 3
+        if result.compound_type == "example_compound":
+            type_text = "Example"
+        elif result.compound_type == "other":
+            type_text = "Other"
+        else:
+            type_text = "-"
+        type_item = QTableWidgetItem(type_text)
+        type_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, 3, type_item)
+
+        # Page number (numeric sort) - column 4
         page_item = NumericTableWidgetItem(str(result.page_number), float(result.page_number))
         page_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 3, page_item)
+        self._table.setItem(row, 4, page_item)
 
-        # Original image - column 4
+        # Original image - column 5
         if result.original_image:
             orig_label = QLabel()
             orig_label.setAlignment(Qt.AlignCenter)
             orig_label.setPixmap(self._pil_to_pixmap(result.original_image))
-            self._table.setCellWidget(row, 4, orig_label)
+            self._table.setCellWidget(row, 5, orig_label)
         else:
-            self._table.setItem(row, 4, QTableWidgetItem("N/A"))
+            self._table.setItem(row, 5, QTableWidgetItem("N/A"))
 
-        # SMILES - column 5
+        # SMILES - column 6
         smiles_item = QTableWidgetItem(result.display_smiles)
         smiles_item.setToolTip(result.display_smiles)  # Show full SMILES on hover
-        self._table.setItem(row, 5, smiles_item)
+        self._table.setItem(row, 6, smiles_item)
 
-        # Valid status with color - column 6
+        # Valid status with color - column 7
         valid_item = QTableWidgetItem(result.validation_status)
         valid_item.setTextAlignment(Qt.AlignCenter)
         if result.is_valid:
             valid_item.setBackground(Qt.green)
         elif result.smiles:
             valid_item.setBackground(Qt.red)
-        self._table.setItem(row, 6, valid_item)
+        self._table.setItem(row, 7, valid_item)
 
-        # RDKit rendering - column 7
+        # RDKit rendering - column 8
         if result.rdkit_image:
             rdkit_label = QLabel()
             rdkit_label.setAlignment(Qt.AlignCenter)
             rdkit_label.setPixmap(self._pil_to_pixmap(result.rdkit_image))
-            self._table.setCellWidget(row, 7, rdkit_label)
+            self._table.setCellWidget(row, 8, rdkit_label)
         else:
-            self._table.setItem(row, 7, QTableWidgetItem("N/A"))
+            self._table.setItem(row, 8, QTableWidgetItem("N/A"))
 
-        # Molecular Weight (numeric sort) - column 8
+        # Molecular Weight (numeric sort) - column 9
         mw_text = f"{result.molecular_weight:.2f}" if result.molecular_weight else "-"
         mw_value = result.molecular_weight if result.molecular_weight else None
         mw_item = NumericTableWidgetItem(mw_text, mw_value)
         mw_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 8, mw_item)
+        self._table.setItem(row, 9, mw_item)
 
-        # cLogP (numeric sort) - column 9
+        # cLogP (numeric sort) - column 10
         clogp_text = f"{result.clogp:.2f}" if result.clogp is not None else "-"
         clogp_value = result.clogp if result.clogp is not None else None
         clogp_item = NumericTableWidgetItem(clogp_text, clogp_value)
         clogp_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 9, clogp_item)
+        self._table.setItem(row, 10, clogp_item)
 
-        # TPSA (numeric sort) - column 10
+        # TPSA (numeric sort) - column 11
         tpsa_text = f"{result.tpsa:.1f}" if result.tpsa is not None else "-"
         tpsa_value = result.tpsa if result.tpsa is not None else None
         tpsa_item = NumericTableWidgetItem(tpsa_text, tpsa_value)
         tpsa_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 10, tpsa_item)
+        self._table.setItem(row, 11, tpsa_item)
 
-        # Rotatable Bonds (numeric sort) - column 11
+        # Rotatable Bonds (numeric sort) - column 12
         rot_text = str(result.num_rotatable_bonds) if result.num_rotatable_bonds is not None else "-"
         rot_value = float(result.num_rotatable_bonds) if result.num_rotatable_bonds is not None else None
         rot_item = NumericTableWidgetItem(rot_text, rot_value)
         rot_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 11, rot_item)
+        self._table.setItem(row, 12, rot_item)
 
-        # Stereocenters (numeric sort) - column 12
+        # Stereocenters (numeric sort) - column 13
         stereo_text = str(result.num_stereocenters) if result.num_stereocenters is not None else "-"
         stereo_value = float(result.num_stereocenters) if result.num_stereocenters is not None else None
         stereo_item = NumericTableWidgetItem(stereo_text, stereo_value)
         stereo_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 12, stereo_item)
+        self._table.setItem(row, 13, stereo_item)
 
-        # Molecular Formula - column 13
+        # Molecular Formula - column 14
         formula_item = QTableWidgetItem(result.molecular_formula or "-")
         formula_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 13, formula_item)
+        self._table.setItem(row, 14, formula_item)
 
         # Add bio data columns (dynamic, starting at column 14)
         for i, col_name in enumerate(self._bio_columns):
@@ -933,17 +945,36 @@ class MainWindow(QMainWindow):
             return
 
         from ..core.page_classifier import PageClassifier
+        from ..core.patent_section_detector import PatentSectionDetector
 
         self._btn_detect_pages.setEnabled(False)
         self._btn_detect_pages.setText("Scanning...")
-        self._statusbar.showMessage("Scanning pages for structures...")
+        self._statusbar.showMessage("Detecting patent sections...")
         QApplication.processEvents()
 
         try:
+            detector = PatentSectionDetector()
             classifier = PageClassifier()
             all_detected = set()
+            section_info = ""
 
             for info in self._pdf_infos:
+                # Step 1: Patent section detection (fast)
+                self._statusbar.showMessage(
+                    f"Detecting sections in {info.file_name}..."
+                )
+                QApplication.processEvents()
+
+                section_bounds = detector.detect(info.file_path)
+                section_pages = section_bounds.get_page_range() if section_bounds.is_valid else set()
+
+                if section_bounds.is_valid:
+                    section_info = (
+                        f"Examples section: pages {section_bounds.examples_start}"
+                        f"-{section_bounds.examples_end}"
+                    )
+
+                # Step 2: Visual page classifier
                 def progress_cb(current, total, _info=info):
                     self._btn_detect_pages.setText(f"Page {current}/{total}")
                     self._statusbar.showMessage(
@@ -951,18 +982,26 @@ class MainWindow(QMainWindow):
                     )
                     QApplication.processEvents()
 
-                detected = classifier.detect_structure_pages(
+                detected = set(classifier.detect_structure_pages(
                     info.file_path, progress_callback=progress_cb
-                )
+                ))
+
+                # Intersect with section bounds if available
+                if detected and section_pages:
+                    detected = detected & section_pages
+                elif section_pages and not detected:
+                    detected = section_pages
+
                 all_detected.update(detected)
 
             # Format detected pages as compact range string
             if all_detected:
                 range_str = self._format_page_set(all_detected)
                 self._txt_page_range.setText(range_str)
-                self._statusbar.showMessage(
-                    f"Detected {len(all_detected)} pages with structures/data"
-                )
+                status = f"Detected {len(all_detected)} pages with structures/data"
+                if section_info:
+                    status += f" ({section_info})"
+                self._statusbar.showMessage(status)
             else:
                 self._txt_page_range.clear()
                 self._statusbar.showMessage("No structure pages detected")
@@ -2145,7 +2184,7 @@ class MainWindow(QMainWindow):
     @Slot(int, int)
     def _on_cell_double_clicked(self, row: int, column: int) -> None:
         """Handle double-click on table cell to copy SMILES."""
-        if column == 5:  # SMILES column (after checkbox, Source, Compound, and Page columns)
+        if column == 6:  # SMILES column (after checkbox, Source, Compound, Type, and Page columns)
             item = self._table.item(row, column)
             if item:
                 smiles = item.text()

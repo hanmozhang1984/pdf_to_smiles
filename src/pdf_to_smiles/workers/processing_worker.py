@@ -1,9 +1,12 @@
 """Background worker for processing PDFs without blocking the UI."""
 
+import logging
 import os
 import re
 import time
 from typing import List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker
 
@@ -251,6 +254,34 @@ class ProcessingWorker(QThread):
                 # If user provided a manual page range, respect it (skip auto-detect)
                 # If no manual range, use auto-detect to skip text-only pages
                 effective_page_filter = self._page_filter
+                section_bounds = None
+
+                # Step 1: Patent section detection (fast, narrows to Examples section)
+                if not self._page_filter:
+                    try:
+                        from ..core.patent_section_detector import PatentSectionDetector
+
+                        def section_progress(msg):
+                            if not self._is_cancelled():
+                                self._emit_progress(
+                                    0, total_pages, 0, 0,
+                                    f"File {file_num}/{total_files}: {msg}"
+                                )
+
+                        detector = PatentSectionDetector()
+                        section_bounds = detector.detect(
+                            pdf_path, progress_callback=section_progress
+                        )
+                        if section_bounds.is_valid:
+                            effective_page_filter = section_bounds.get_page_range()
+                            self._emit_progress(
+                                0, total_pages, 0, 0,
+                                f"File {file_num}/{total_files}: {section_bounds.summary()}"
+                            )
+                    except Exception as e:
+                        logger.debug("Patent section detection failed: %s", e)
+
+                # Step 2: Auto-detect structure pages (visual scan)
                 if self._auto_detect_pages and not self._page_filter:
                     self._emit_progress(
                         0, total_pages, 0, 0,
@@ -273,7 +304,11 @@ class ProcessingWorker(QThread):
                         ))
 
                         if auto_detected:
-                            effective_page_filter = auto_detected
+                            if effective_page_filter:
+                                # Intersect with section bounds
+                                effective_page_filter = effective_page_filter & auto_detected
+                            else:
+                                effective_page_filter = auto_detected
                             self._emit_progress(
                                 0, total_pages, 0, 0,
                                 f"File {file_num}/{total_files}: Found {len(effective_page_filter)} "
@@ -289,7 +324,7 @@ class ProcessingWorker(QThread):
                             continue
 
                     except Exception as e:
-                        # Auto-detection failed — fall back to processing all pages
+                        # Auto-detection failed — fall back to section bounds or all pages
                         self._emit_progress(
                             0, total_pages, 0, 0,
                             f"File {file_num}/{total_files}: Page scan failed ({e}), processing all pages..."
@@ -346,13 +381,20 @@ class ProcessingWorker(QThread):
                         page_num, total_pages, 0, 0,
                         f"File {file_num}/{total_files}: Detecting structures on page {page_num} ({mode_label})..."
                     )
-                    structures = self._inference_provider.detect_structures(page_image)
+                    structures_with_boxes = self._inference_provider.detect_structures_with_boxes(page_image)
 
-                    if not structures:
+                    if not structures_with_boxes:
                         self._pages_processed += 1
                         continue
 
+                    structures = [img for img, _ in structures_with_boxes]
+                    structure_boxes = [box for _, box in structures_with_boxes]
                     total_structures = len(structures)
+
+                    # Classify structures using Claude Haiku (if API key available)
+                    compound_types = self._classify_structures(
+                        page_image, structure_boxes
+                    )
 
                     # Detect example numbers from page using OCR
                     # Falls back to sequential numbering if OCR is unavailable
@@ -395,6 +437,10 @@ class ProcessingWorker(QThread):
                             compound_id, bbox = compound_results[struct_idx]
                             result.compound_id = compound_id
                             result.bounding_box = bbox
+
+                        # Set compound type from LLM classifier
+                        if compound_types and struct_idx < len(compound_types):
+                            result.compound_type = compound_types[struct_idx]
 
                         try:
                             # Predict SMILES (uses cloud or local based on settings)
@@ -440,10 +486,13 @@ class ProcessingWorker(QThread):
                         f"File {file_num}/{total_files}: Extracting biological data..."
                     )
                     try:
-                        # Use user's original page filter (not auto-detected),
-                        # because bio data tables are on different pages than structures
+                        # Use user's original page filter if set; otherwise use
+                        # section bounds to limit bio data extraction to Examples section
+                        bio_page_filter = self._page_filter
+                        if not bio_page_filter and section_bounds and section_bounds.is_valid:
+                            bio_page_filter = section_bounds.get_page_range()
                         bio_data = self._bio_data_extractor.extract_from_pdf(
-                            pdf_path, page_filter=self._page_filter
+                            pdf_path, page_filter=bio_page_filter
                         )
 
                         if bio_data:
@@ -638,6 +687,31 @@ class ProcessingWorker(QThread):
 
         except Exception:
             return [(str(fallback_start_id + i), None) for i in range(total_structures)]
+
+    def _classify_structures(
+        self,
+        page_image,
+        structure_boxes: list,
+    ) -> Optional[list]:
+        """Classify structures as example_compound or other using Claude Haiku.
+
+        Returns None if the classifier is not available (no API key).
+        """
+        # Only classify if we have bounding boxes and the classifier is available
+        valid_boxes = [box for box in structure_boxes if box is not None]
+        if not valid_boxes or len(valid_boxes) != len(structure_boxes):
+            return None
+
+        try:
+            from ..core.llm_compound_classifier import is_available, LLMCompoundClassifier
+            if not is_available():
+                return None
+
+            classifier = LLMCompoundClassifier()
+            return classifier.classify_page_structures(page_image, valid_boxes)
+        except Exception as e:
+            logger.debug("Compound classification failed: %s", e)
+            return None
 
     @staticmethod
     def _format_eta(seconds: float) -> str:

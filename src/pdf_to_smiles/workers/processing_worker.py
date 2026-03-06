@@ -392,23 +392,36 @@ class ProcessingWorker(QThread):
                     total_structures = len(structures)
 
                     # Classify structures using Claude Haiku (if API key available)
-                    compound_types = self._classify_structures(
-                        page_image, structure_boxes
+                    # Returns list of {"type": str, "id": Optional[str]} or None
+                    classification_results = self._classify_structures(
+                        page_image, structure_boxes,
+                        page_num=page_num,
+                        section_bounds=section_bounds,
+                        structure_images=structures,
                     )
 
                     # Detect example numbers from page using OCR
                     # Falls back to sequential numbering if OCR is unavailable
                     compound_results = self._detect_example_numbers_from_page(
-                        page_image, structures, next_compound_id
+                        page_image, structures, next_compound_id,
+                        structure_boxes=structure_boxes,
                     )
 
-                    # Update next_compound_id: use max detected ID + 1 to avoid collisions
+                    # Update next_compound_id: collect all numeric IDs from both LLM and OCR
                     detected_ids = []
                     for cid, _ in compound_results:
                         try:
                             detected_ids.append(int(re.sub(r'[a-zA-Z]', '', cid)))
                         except ValueError:
                             pass
+                    if classification_results:
+                        for cr in classification_results:
+                            llm_id = cr.get("id")
+                            if llm_id:
+                                try:
+                                    detected_ids.append(int(re.sub(r'[a-zA-Z]', '', llm_id)))
+                                except ValueError:
+                                    pass
                     if detected_ids:
                         next_compound_id = max(max(detected_ids) + 1, next_compound_id + total_structures)
                     else:
@@ -432,15 +445,20 @@ class ProcessingWorker(QThread):
                             original_image=struct_image
                         )
 
-                        # Get compound ID and bounding box from batch results
+                        # Get compound ID and bounding box from OCR results
                         if struct_idx < len(compound_results):
                             compound_id, bbox = compound_results[struct_idx]
                             result.compound_id = compound_id
                             result.bounding_box = bbox
 
-                        # Set compound type from LLM classifier
-                        if compound_types and struct_idx < len(compound_types):
-                            result.compound_type = compound_types[struct_idx]
+                        # Set compound type and override ID from LLM classifier
+                        if classification_results and struct_idx < len(classification_results):
+                            cr = classification_results[struct_idx]
+                            result.compound_type = cr["type"]
+                            # LLM compound ID takes priority over OCR
+                            llm_id = cr.get("id")
+                            if llm_id:
+                                result.compound_id = llm_id
 
                         try:
                             # Predict SMILES (uses cloud or local based on settings)
@@ -566,7 +584,8 @@ class ProcessingWorker(QThread):
         self,
         page_image,
         structures: list,
-        fallback_start_id: int
+        fallback_start_id: int,
+        structure_boxes: Optional[List[Optional[tuple]]] = None,
     ) -> List[Tuple[str, Optional[tuple]]]:
         """Detect example/compound numbers from the page using OCR.
 
@@ -579,6 +598,9 @@ class ProcessingWorker(QThread):
             page_image: PIL Image of the full PDF page (already at 200dpi).
             structures: List of detected structure images.
             fallback_start_id: Starting ID for sequential fallback.
+            structure_boxes: Optional list of (x1, y1, x2, y2) bounding boxes
+                for each structure. Used for accurate Y-position matching
+                when available. May contain None entries.
 
         Returns:
             List of (compound_id, bounding_box) tuples, one per structure.
@@ -644,11 +666,32 @@ class ProcessingWorker(QThread):
             # Sort by Y position (top to bottom)
             detected_numbers.sort(key=lambda x: x[1])
 
-            # If we found more numbers than structures, try to pick the best subset
-            # If fewer, we'll use fallback for unmatched structures
-            # Estimate Y position for each structure (evenly distributed)
+            # Determine Y position for each structure.
+            # Use actual bounding boxes when available; fall back to even distribution.
             struct_y_positions = []
-            if total_structures == 1:
+            if structure_boxes and len(structure_boxes) == total_structures:
+                for i, box in enumerate(structure_boxes):
+                    if box is not None:
+                        # Use Y center of actual bounding box
+                        _, y1, _, y2 = box
+                        struct_y_positions.append((y1 + y2) // 2)
+                    else:
+                        # Placeholder — will be replaced below if needed
+                        struct_y_positions.append(None)
+
+                # Fill any None positions with interpolation
+                if any(p is None for p in struct_y_positions):
+                    if total_structures == 1:
+                        struct_y_positions = [height // 2]
+                    else:
+                        margin = height * 0.1
+                        usable_height = height - 2 * margin
+                        struct_y_positions = [
+                            p if p is not None
+                            else int(margin + (usable_height * i) / (total_structures - 1))
+                            for i, p in enumerate(struct_y_positions)
+                        ]
+            elif total_structures == 1:
                 struct_y_positions = [height // 2]
             else:
                 margin = height * 0.1
@@ -688,18 +731,88 @@ class ProcessingWorker(QThread):
         except Exception:
             return [(str(fallback_start_id + i), None) for i in range(total_structures)]
 
+    @staticmethod
+    def _locate_structures_on_page(
+        page_image,
+        structure_images: list,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Locate cropped structure images on the full page via template matching.
+
+        Used when the detector doesn't provide bounding boxes (cloud/DECIMER).
+
+        Args:
+            page_image: Full page PIL Image.
+            structure_images: List of cropped structure PIL Images.
+
+        Returns:
+            List of (x1, y1, x2, y2) bounding boxes in page coordinates.
+        """
+        import numpy as np
+        try:
+            import cv2
+        except ImportError:
+            # Fallback: evenly distribute boxes vertically
+            w, h = page_image.size
+            n = len(structure_images)
+            boxes = []
+            margin = int(h * 0.1)
+            usable = h - 2 * margin
+            for i in range(n):
+                y_center = margin + (usable * i // max(n - 1, 1)) if n > 1 else h // 2
+                sw, sh = structure_images[i].size
+                x1 = max(0, (w - sw) // 2)
+                y1 = max(0, y_center - sh // 2)
+                boxes.append((x1, y1, x1 + sw, y1 + sh))
+            return boxes
+
+        page_gray = np.array(page_image.convert("L"))
+        boxes = []
+        for struct_img in structure_images:
+            sw, sh = struct_img.size
+            # Skip if template is larger than the page
+            if sw >= page_gray.shape[1] or sh >= page_gray.shape[0]:
+                # Use center of page as fallback
+                pw, ph = page_image.size
+                boxes.append((max(0, (pw - sw) // 2), max(0, (ph - sh) // 2),
+                              min(pw, (pw + sw) // 2), min(ph, (ph + sh) // 2)))
+                continue
+
+            template = np.array(struct_img.convert("L"))
+            result = cv2.matchTemplate(page_gray, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+            if max_val > 0.3:
+                x1, y1 = max_loc
+                boxes.append((x1, y1, x1 + sw, y1 + sh))
+            else:
+                # Low confidence — use center fallback
+                pw, ph = page_image.size
+                boxes.append((max(0, (pw - sw) // 2), max(0, (ph - sh) // 2),
+                              min(pw, (pw + sw) // 2), min(ph, (ph + sh) // 2)))
+        return boxes
+
     def _classify_structures(
         self,
         page_image,
         structure_boxes: list,
+        page_num: Optional[int] = None,
+        section_bounds=None,
+        structure_images: Optional[list] = None,
     ) -> Optional[list]:
         """Classify structures as example_compound or other using Claude Haiku.
 
+        Args:
+            page_image: Full page image (PIL Image).
+            structure_boxes: List of bounding boxes for detected structures.
+                May contain None entries for backends that don't provide boxes.
+            page_num: 1-indexed page number (for section context).
+            section_bounds: SectionBounds from PatentSectionDetector (optional).
+            structure_images: List of cropped structure images (used to locate
+                structures on the page when bounding boxes are not available).
+
         Returns None if the classifier is not available (no API key).
         """
-        # Only classify if we have bounding boxes and the classifier is available
-        valid_boxes = [box for box in structure_boxes if box is not None]
-        if not valid_boxes or len(valid_boxes) != len(structure_boxes):
+        if not structure_boxes:
             return None
 
         try:
@@ -707,8 +820,30 @@ class ProcessingWorker(QThread):
             if not is_available():
                 return None
 
-            classifier = LLMCompoundClassifier()
-            return classifier.classify_page_structures(page_image, valid_boxes)
+            # If any boxes are None, try to locate structures via template matching
+            if any(box is None for box in structure_boxes):
+                if structure_images and len(structure_images) == len(structure_boxes):
+                    computed_boxes = self._locate_structures_on_page(
+                        page_image, structure_images
+                    )
+                    # Merge: use original box if available, computed box otherwise
+                    structure_boxes = [
+                        orig if orig is not None else computed
+                        for orig, computed in zip(structure_boxes, computed_boxes)
+                    ]
+                else:
+                    logger.debug("Cannot classify: no bounding boxes and no structure images")
+                    return None
+
+            # Reuse classifier instance across pages (shares Anthropic client)
+            if not hasattr(self, '_compound_classifier'):
+                self._compound_classifier = LLMCompoundClassifier()
+
+            return self._compound_classifier.classify_page_structures(
+                page_image, structure_boxes,
+                page_num=page_num,
+                section_bounds=section_bounds,
+            )
         except Exception as e:
             logger.debug("Compound classification failed: %s", e)
             return None

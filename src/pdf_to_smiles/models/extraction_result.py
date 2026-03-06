@@ -26,6 +26,7 @@ class ExtractionResult:
         num_stereocenters: Number of stereogenic centers.
         molecular_formula: Molecular formula string.
         compound_id: Detected compound/example number from nearby text (e.g., "Compound 1").
+        compound_type: Classification label from LLM classifier ("example_compound" or "other").
         bounding_box: Structure position in page coordinates (x1, y1, x2, y2).
         ic50: IC50 value from biological data tables.
         ec50: EC50 value from biological data tables.
@@ -50,6 +51,7 @@ class ExtractionResult:
     molecular_formula: Optional[str] = None
     # Compound identification
     compound_id: Optional[str] = None  # Detected compound/example number (e.g., "Compound 1")
+    compound_type: Optional[str] = None  # "example_compound" or "other" (from LLM classifier)
     bounding_box: Optional[tuple] = None  # (x1, y1, x2, y2) in page coordinates
     # Biological data - legacy fields (kept for backwards compatibility)
     ic50: Optional[str] = None

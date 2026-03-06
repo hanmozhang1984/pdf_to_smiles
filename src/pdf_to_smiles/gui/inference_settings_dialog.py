@@ -85,6 +85,33 @@ class InferenceSettingsDialog(QDialog):
 
         layout.addWidget(cloud_group)
 
+        # Anthropic API Key group
+        api_key_group = QGroupBox("Anthropic API Key (Structure Classification)")
+        api_key_layout = QVBoxLayout(api_key_group)
+
+        key_input_layout = QHBoxLayout()
+        self._txt_api_key = QLineEdit()
+        self._txt_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._txt_api_key.setPlaceholderText("sk-ant-...")
+        key_input_layout.addWidget(self._txt_api_key)
+
+        self._btn_toggle_key = QPushButton("Show")
+        self._btn_toggle_key.setFixedWidth(50)
+        self._btn_toggle_key.clicked.connect(self._on_toggle_key_visibility)
+        key_input_layout.addWidget(self._btn_toggle_key)
+
+        api_key_layout.addLayout(key_input_layout)
+
+        self._lbl_api_key_status = QLabel()
+        api_key_layout.addWidget(self._lbl_api_key_status)
+
+        helper_label = QLabel("Required for automatic structure classification (example vs. other)")
+        helper_label.setStyleSheet("color: gray; font-size: 11px;")
+        helper_label.setWordWrap(True)
+        api_key_layout.addWidget(helper_label)
+
+        layout.addWidget(api_key_group)
+
         # Status info
         status_group = QGroupBox("Current Status")
         status_layout = QVBoxLayout(status_group)
@@ -135,6 +162,11 @@ class InferenceSettingsDialog(QDialog):
         if self._settings.cloud_endpoint:
             self._txt_endpoint.setText(self._settings.cloud_endpoint)
 
+        if self._settings.anthropic_api_key:
+            self._txt_api_key.setText(self._settings.anthropic_api_key)
+
+        self._txt_api_key.textChanged.connect(lambda: self._update_api_key_status())
+        self._update_api_key_status()
         self._on_mode_changed()
 
     def _on_mode_changed(self) -> None:
@@ -205,6 +237,24 @@ class InferenceSettingsDialog(QDialog):
         finally:
             self._btn_test.setEnabled(True)
 
+    def _on_toggle_key_visibility(self) -> None:
+        """Toggle API key visibility."""
+        if self._txt_api_key.echoMode() == QLineEdit.EchoMode.Password:
+            self._txt_api_key.setEchoMode(QLineEdit.EchoMode.Normal)
+            self._btn_toggle_key.setText("Hide")
+        else:
+            self._txt_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+            self._btn_toggle_key.setText("Show")
+
+    def _update_api_key_status(self) -> None:
+        """Update the API key status label."""
+        if self._txt_api_key.text().strip():
+            self._lbl_api_key_status.setText("Status: Active")
+            self._lbl_api_key_status.setStyleSheet("color: green;")
+        else:
+            self._lbl_api_key_status.setText("Status: Not set")
+            self._lbl_api_key_status.setStyleSheet("color: gray;")
+
     def _on_accept(self) -> None:
         """Save settings and close dialog."""
         # Determine selected mode
@@ -228,6 +278,11 @@ class InferenceSettingsDialog(QDialog):
                 )
                 return
             self._settings.cloud_endpoint = endpoint
+
+        # Save API key
+        api_key = self._txt_api_key.text().strip()
+        self._settings.anthropic_api_key = api_key
+        self._settings.apply_api_keys()
 
         # Save mode
         self._settings.mode = mode

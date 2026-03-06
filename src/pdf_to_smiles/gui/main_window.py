@@ -471,6 +471,10 @@ class MainWindow(QMainWindow):
         self._lbl_inference_mode.setWordWrap(True)
         inference_layout.addWidget(self._lbl_inference_mode)
 
+        # Classifier status label
+        self._lbl_classifier_status = QLabel(self._get_classifier_status_text())
+        inference_layout.addWidget(self._lbl_classifier_status)
+
         # Settings button
         self._btn_inference_settings = QPushButton("Settings...")
         self._btn_inference_settings.clicked.connect(self._on_inference_settings)
@@ -2209,6 +2213,12 @@ class MainWindow(QMainWindow):
         else:
             return "Mode: Local CPU"
 
+    def _get_classifier_status_text(self) -> str:
+        """Get display text for classifier API key status."""
+        if self._inference_settings.anthropic_api_key:
+            return '<span style="color: green;">Classifier: Active</span>'
+        return '<span style="color: gray;">Classifier: No API key</span>'
+
     @Slot()
     def _on_inference_settings(self) -> None:
         """Open inference settings dialog."""
@@ -2216,8 +2226,9 @@ class MainWindow(QMainWindow):
 
         dialog = InferenceSettingsDialog(self)
         if dialog.exec() == QDialog.Accepted:
-            # Update the mode label
+            # Update the mode and classifier labels
             self._lbl_inference_mode.setText(self._get_inference_mode_text())
+            self._lbl_classifier_status.setText(self._get_classifier_status_text())
             mode = self._inference_settings.mode
             if mode == InferenceMode.CLOUD:
                 self._statusbar.showMessage("Inference mode: Cloud GPU (Modal.com)")

@@ -59,6 +59,11 @@ class LightweightDetector:
     SUB_MAX_TEXT_DENSITY = 4.0   # Max text lines per 100px height (chemical names are denser)
     SUB_MORPH_KERNEL = 8         # Smaller kernel for within-table detection
 
+    @staticmethod
+    def _compute_padding(w: int, h: int) -> int:
+        """Compute adaptive padding based on structure dimensions."""
+        return max(8, min(40, int(0.05 * (w + h) / 2)))
+
     def detect_structures(self, page_image: Image.Image) -> List[Image.Image]:
         """Detect and extract chemical structures from a page image.
 
@@ -68,6 +73,27 @@ class LightweightDetector:
         Returns:
             List of PIL Images, each containing a detected chemical structure.
         """
+        candidates = self._detect_candidates(page_image)
+        return [img for _, _, img, _ in candidates]
+
+    def detect_structures_with_boxes(
+        self, page_image: Image.Image
+    ) -> List[Tuple[Image.Image, Tuple[int, int, int, int]]]:
+        """Detect structures and return images with their bounding boxes.
+
+        Args:
+            page_image: PIL Image of a PDF page.
+
+        Returns:
+            List of (cropped_image, (x1, y1, x2, y2)) tuples.
+        """
+        candidates = self._detect_candidates(page_image)
+        return [(img, box) for _, _, img, box in candidates]
+
+    def _detect_candidates(
+        self, page_image: Image.Image
+    ) -> List[Tuple[int, int, Image.Image, Tuple[int, int, int, int]]]:
+        """Core detection returning (y, x, image, bbox) tuples sorted by position."""
         try:
             img_array = np.array(page_image.convert('RGB'))
             gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
@@ -91,7 +117,9 @@ class LightweightDetector:
                 closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
 
-            candidates = []
+            # Collect candidates with both padded and unpadded boxes
+            # Internal format: (y, x, image, padded_box, unpadded_box)
+            candidates_with_unpadded = []
             for contour in contours:
                 area = cv2.contourArea(contour)
                 x, y, w, h = cv2.boundingRect(contour)
@@ -101,7 +129,7 @@ class LightweightDetector:
                     sub_results = self._extract_from_table_region(
                         binary, img_array, x, y, w, h, page_width, page_height
                     )
-                    candidates.extend(sub_results)
+                    candidates_with_unpadded.extend(sub_results)
                     continue
 
                 # Pass 1: Normal-sized regions — evaluate directly
@@ -109,20 +137,92 @@ class LightweightDetector:
                     contour, binary, img_array, page_width, page_height
                 )
                 if result is not None:
-                    candidates.append(result)
+                    candidates_with_unpadded.append(result)
+
+            # Suppress overlapping padding between adjacent structures
+            candidates_with_unpadded = self._suppress_overlaps(
+                candidates_with_unpadded, img_array
+            )
+
+            # Strip unpadded box for public interface: (y, x, image, padded_box)
+            candidates = [
+                (cy, cx, img, pbox)
+                for cy, cx, img, pbox, _ubox in candidates_with_unpadded
+            ]
 
             # Sort by position: top-to-bottom, then left-to-right
             candidates.sort(key=lambda c: (c[0], c[1]))
-            return [img for _, _, img in candidates]
+            return candidates
 
         except Exception as e:
             raise RuntimeError(f"Lightweight structure detection failed: {e}") from e
 
-    def _remove_table_lines(self, binary_roi: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _suppress_overlaps(candidates, img_array: np.ndarray):
+        """Trim overlapping padding between adjacent structure boxes.
+
+        When two padded bounding boxes overlap, split the shared space at the
+        midpoint of the *unpadded* edges. Never trims below the original
+        contour bounding box — only padding is reduced, not structure content.
+
+        Args:
+            candidates: list of (y, x, image, padded_box, unpadded_box)
+            img_array: page image array for re-cropping
+        """
+        if len(candidates) <= 1:
+            return candidates
+
+        padded = [list(c[3]) for c in candidates]
+        unpadded = [c[4] for c in candidates]
+
+        for i in range(len(padded)):
+            for j in range(i + 1, len(padded)):
+                ax1, ay1, ax2, ay2 = padded[i]
+                bx1, by1, bx2, by2 = padded[j]
+
+                # Check if padded boxes overlap at all
+                if ax2 <= bx1 or bx2 <= ax1 or ay2 <= by1 or by2 <= ay1:
+                    continue
+
+                uax1, uay1, uax2, uay2 = unpadded[i]
+                ubx1, uby1, ubx2, uby2 = unpadded[j]
+
+                # Vertical overlap: A is above B
+                if ay2 > by1 and ay1 < by1:
+                    # Split at midpoint of unpadded edges
+                    mid_y = (uay2 + uby1) // 2
+                    # Trim but never below unpadded box
+                    padded[i][3] = max(uay2, min(ay2, mid_y))
+                    padded[j][1] = min(uby1, max(by1, mid_y))
+
+                # Horizontal overlap: A is left of B
+                if ax2 > bx1 and ax1 < bx1:
+                    mid_x = (uax2 + ubx1) // 2
+                    padded[i][2] = max(uax2, min(ax2, mid_x))
+                    padded[j][0] = min(ubx1, max(bx1, mid_x))
+
+        # Re-crop images using adjusted boxes
+        result = []
+        for idx, cand in enumerate(candidates):
+            x1, y1, x2, y2 = padded[idx]
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = img_array[y1:y2, x1:x2]
+            box = (x1, y1, x2, y2)
+            result.append((y1, x1, Image.fromarray(crop), box, cand[4]))
+        return result
+
+    def _remove_table_lines(
+        self, binary_roi: np.ndarray
+    ) -> Tuple[np.ndarray, List[int], List[int]]:
         """Remove long horizontal and vertical lines (table borders) from a binary ROI.
 
         Detects lines spanning a significant fraction of the ROI dimensions and
         erases them, leaving only cell content (structures, text, etc.).
+
+        Returns:
+            (cleaned_roi, h_positions, v_positions) where h_positions and
+            v_positions are sorted lists of Y/X coordinates of detected grid lines.
         """
         h, w = binary_roi.shape
         cleaned = binary_roi.copy()
@@ -141,6 +241,10 @@ class LightweightDetector:
         )
         vert_lines = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, vert_kernel)
 
+        # Extract line positions from the detected line masks
+        h_positions = self._extract_line_positions(horiz_lines, axis=1)
+        v_positions = self._extract_line_positions(vert_lines, axis=0)
+
         # Combine and dilate slightly to ensure full removal
         grid_lines = cv2.bitwise_or(horiz_lines, vert_lines)
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -148,7 +252,42 @@ class LightweightDetector:
 
         # Erase the grid lines from the ROI
         cleaned = cv2.subtract(cleaned, grid_lines)
-        return cleaned
+        return cleaned, h_positions, v_positions
+
+    @staticmethod
+    def _extract_line_positions(line_mask: np.ndarray, axis: int) -> List[int]:
+        """Extract sorted positions of detected lines along the given axis.
+
+        Args:
+            line_mask: Binary mask of detected lines.
+            axis: 1 for horizontal lines (returns Y positions),
+                  0 for vertical lines (returns X positions).
+
+        Returns:
+            Sorted list of line center positions.
+        """
+        # Project along the perpendicular axis
+        projection = np.sum(line_mask > 0, axis=axis)
+        threshold = max(1, line_mask.shape[axis] // 8)
+
+        positions = []
+        in_line = False
+        start = 0
+
+        for i, val in enumerate(projection):
+            if val >= threshold:
+                if not in_line:
+                    start = i
+                    in_line = True
+            else:
+                if in_line:
+                    positions.append((start + i) // 2)  # center of line
+                    in_line = False
+
+        if in_line:
+            positions.append((start + len(projection)) // 2)
+
+        return sorted(positions)
 
     def _extract_from_table_region(
         self,
@@ -156,7 +295,7 @@ class LightweightDetector:
         img_array: np.ndarray,
         rx: int, ry: int, rw: int, rh: int,
         page_width: int, page_height: int,
-    ) -> List[Tuple[int, int, Image.Image]]:
+    ) -> List[Tuple[int, int, Image.Image, Tuple[int, int, int, int]]]:
         """Extract individual structures from within a large region (e.g. a table).
 
         Removes table grid lines first, then uses a smaller morphological kernel
@@ -166,7 +305,7 @@ class LightweightDetector:
         roi = binary[ry:ry+rh, rx:rx+rw]
 
         # Remove table grid lines so cells become separate contours
-        cleaned_roi = self._remove_table_lines(roi)
+        cleaned_roi, h_positions, v_positions = self._remove_table_lines(roi)
 
         # Smaller morph kernel to keep structures separate from text
         kernel = cv2.getStructuringElement(
@@ -225,13 +364,36 @@ class LightweightDetector:
             # Map coordinates back to page space
             abs_x = rx + x
             abs_y = ry + y
-            x1 = max(0, abs_x - self.CROP_PADDING)
-            y1 = max(0, abs_y - self.CROP_PADDING)
-            x2 = min(page_width, abs_x + w + self.CROP_PADDING)
-            y2 = min(page_height, abs_y + h + self.CROP_PADDING)
+            unpadded_box = (abs_x, abs_y, abs_x + w, abs_y + h)
+            padding = self._compute_padding(w, h)
+
+            # Find enclosing cell boundaries from grid lines
+            cell_x1 = max((vp for vp in v_positions if vp <= x), default=0)
+            cell_x2 = min((vp for vp in v_positions if vp >= x + w), default=rw)
+            cell_y1 = max((hp for hp in h_positions if hp <= y), default=0)
+            cell_y2 = min((hp for hp in h_positions if hp >= y + h), default=rh)
+
+            # Clamp padding to stay within the cell (positions are ROI-relative)
+            # But never trim tighter than the unpadded contour box
+            x1 = max(rx + cell_x1, abs_x - padding)
+            y1 = max(ry + cell_y1, abs_y - padding)
+            x2 = min(rx + cell_x2, abs_x + w + padding)
+            y2 = min(ry + cell_y2, abs_y + h + padding)
+
+            # Ensure we never crop into the actual structure content
+            x1 = min(x1, abs_x)
+            y1 = min(y1, abs_y)
+            x2 = max(x2, abs_x + w)
+            y2 = max(y2, abs_y + h)
+
+            # Clamp to page boundaries
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(page_width, x2)
+            y2 = min(page_height, y2)
 
             crop = img_array[y1:y2, x1:x2]
-            results.append((y1, x1, Image.fromarray(crop)))
+            results.append((y1, x1, Image.fromarray(crop), (x1, y1, x2, y2), unpadded_box))
 
         return results
 
@@ -242,9 +404,11 @@ class LightweightDetector:
         img_array: np.ndarray,
         page_width: int,
         page_height: int,
-    ) -> Optional[Tuple[int, int, Image.Image]]:
-        """Evaluate a contour candidate — return (y, x, image) or None if rejected."""
+    ) -> Optional[tuple]:
+        """Evaluate a contour candidate.
 
+        Returns (y, x, image, padded_box, unpadded_box) or None if rejected.
+        """
         area = cv2.contourArea(contour)
         if area < self.MIN_AREA:
             return None
@@ -279,13 +443,16 @@ class LightweightDetector:
         if not self._has_line_features(roi):
             return None
 
-        x1 = max(0, x - self.CROP_PADDING)
-        y1 = max(0, y - self.CROP_PADDING)
-        x2 = min(page_width, x + w + self.CROP_PADDING)
-        y2 = min(page_height, y + h + self.CROP_PADDING)
+        unpadded_box = (x, y, x + w, y + h)
+
+        padding = self._compute_padding(w, h)
+        x1 = max(0, x - padding)
+        y1 = max(0, y - padding)
+        x2 = min(page_width, x + w + padding)
+        y2 = min(page_height, y + h + padding)
 
         crop = img_array[y1:y2, x1:x2]
-        return (y1, x1, Image.fromarray(crop))
+        return (y1, x1, Image.fromarray(crop), (x1, y1, x2, y2), unpadded_box)
 
     def _count_text_lines(self, binary_roi: np.ndarray) -> int:
         """Count the number of horizontal text-line bands in a region."""

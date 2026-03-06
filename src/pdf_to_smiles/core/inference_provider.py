@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from PIL import Image
 
 from .inference_settings import InferenceSettings, InferenceMode
@@ -87,6 +87,26 @@ class InferenceProvider:
         else:
             detector = self._get_local_detector()
             return detector.detect_structures(page_image)
+
+    def detect_structures_with_boxes(
+        self, page_image: Image.Image
+    ) -> List[Tuple[Image.Image, Optional[Tuple[int, int, int, int]]]]:
+        """Detect structures and return images with bounding boxes.
+
+        Args:
+            page_image: PIL Image of a PDF page.
+
+        Returns:
+            List of (cropped_image, (x1, y1, x2, y2)) tuples.
+            Bounding box is None for backends that don't support it.
+        """
+        if self._settings.is_lightweight:
+            detector = self._get_lightweight_detector()
+            return detector.detect_structures_with_boxes(page_image)
+        else:
+            # Other backends don't support bounding boxes — return None for each
+            structures = self.detect_structures(page_image)
+            return [(img, None) for img in structures]
 
     def predict_smiles(
         self,

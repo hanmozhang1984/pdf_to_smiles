@@ -357,8 +357,9 @@ class LightweightDetector:
             if fill_ratio > 0.13 and text_lines >= 3:
                 continue
 
-            # Must have line features (bonds)
-            if not self._has_line_features(sub_roi):
+            # Must have line features (bonds) — relaxed threshold for table
+            # sub-contours since column context already confirms structure
+            if not self._has_line_features(sub_roi, min_lines=1):
                 continue
 
             # Map coordinates back to page space
@@ -480,8 +481,15 @@ class LightweightDetector:
 
         return text_lines
 
-    def _has_line_features(self, binary_roi: np.ndarray) -> bool:
-        """Check if the region contains straight line segments (bonds)."""
+    def _has_line_features(self, binary_roi: np.ndarray, min_lines: int = 3) -> bool:
+        """Check if the region contains straight line segments (bonds).
+
+        Args:
+            binary_roi: Binary image of the region.
+            min_lines: Minimum number of Hough line segments required.
+                Default 3 for standalone candidates; use 1 for table
+                sub-contours where column context already confirms structure.
+        """
         edges = cv2.Canny(binary_roi, 50, 150)
 
         h, w = binary_roi.shape
@@ -498,4 +506,4 @@ class LightweightDetector:
         if lines is None:
             return False
 
-        return len(lines) >= 3
+        return len(lines) >= min_lines

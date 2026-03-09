@@ -50,6 +50,14 @@ class InferenceSettingsDialog(QDialog):
         )
         mode_layout.addWidget(self._radio_local_gpu)
 
+        self._radio_molsight = QRadioButton("MolSight (best stereochemistry)")
+        self._radio_molsight.setToolTip(
+            "EfficientViT + transformer decoder.\n"
+            "Runs in separate venv (/tmp/MolSight/venv).\n"
+            "Best for stereochemistry-heavy structures."
+        )
+        mode_layout.addWidget(self._radio_molsight)
+
         self._radio_local_cpu = QRadioButton("Local CPU (DECIMER, slow)")
         self._radio_local_cpu.setToolTip(
             "Use CPU for inference via DECIMER/TensorFlow.\n"
@@ -141,6 +149,7 @@ class InferenceSettingsDialog(QDialog):
         self._radio_lightweight.toggled.connect(self._on_mode_changed)
         self._radio_cloud.toggled.connect(self._on_mode_changed)
         self._radio_local_gpu.toggled.connect(self._on_mode_changed)
+        self._radio_molsight.toggled.connect(self._on_mode_changed)
         self._radio_local_cpu.toggled.connect(self._on_mode_changed)
 
         # Don't auto-check status on open (can be slow due to TensorFlow import)
@@ -156,6 +165,8 @@ class InferenceSettingsDialog(QDialog):
             self._radio_local_gpu.setChecked(True)
         elif mode == InferenceMode.LOCAL_LIGHTWEIGHT:
             self._radio_lightweight.setChecked(True)
+        elif mode == InferenceMode.MOLSIGHT:
+            self._radio_molsight.setChecked(True)
         else:
             self._radio_local_cpu.setChecked(True)
 
@@ -264,6 +275,8 @@ class InferenceSettingsDialog(QDialog):
             mode = InferenceMode.CLOUD
         elif self._radio_local_gpu.isChecked():
             mode = InferenceMode.LOCAL_GPU
+        elif self._radio_molsight.isChecked():
+            mode = InferenceMode.MOLSIGHT
         else:
             mode = InferenceMode.LOCAL_CPU
 
@@ -297,5 +310,7 @@ class InferenceSettingsDialog(QDialog):
             return InferenceMode.CLOUD
         elif self._radio_local_gpu.isChecked():
             return InferenceMode.LOCAL_GPU
+        elif self._radio_molsight.isChecked():
+            return InferenceMode.MOLSIGHT
         else:
             return InferenceMode.LOCAL_CPU

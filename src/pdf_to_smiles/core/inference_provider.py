@@ -30,6 +30,7 @@ class InferenceProvider:
         self._lightweight_detector = None
         self._lightweight_predictor = None
         self._cloud_client = None
+        self._molsight_predictor = None
 
     def _get_local_detector(self):
         """Get or create local structure detector (DECIMER)."""
@@ -59,6 +60,13 @@ class InferenceProvider:
             self._lightweight_predictor = LightweightPredictor()
         return self._lightweight_predictor
 
+    def _get_molsight_predictor(self):
+        """Get or create MolSight predictor (subprocess in separate venv)."""
+        if self._molsight_predictor is None:
+            from .molsight_predictor import MolSightPredictor
+            self._molsight_predictor = MolSightPredictor()
+        return self._molsight_predictor
+
     def _get_cloud_client(self):
         """Get or create cloud inference client."""
         if self._cloud_client is None:
@@ -81,7 +89,7 @@ class InferenceProvider:
         if self._settings.is_cloud:
             client = self._get_cloud_client()
             return client.segment_structures(page_image)
-        elif self._settings.is_lightweight:
+        elif self._settings.is_lightweight or self._settings.is_molsight:
             detector = self._get_lightweight_detector()
             return detector.detect_structures(page_image)
         else:
@@ -100,7 +108,7 @@ class InferenceProvider:
             List of (cropped_image, (x1, y1, x2, y2)) tuples.
             Bounding box is None for backends that don't support it.
         """
-        if self._settings.is_lightweight:
+        if self._settings.is_lightweight or self._settings.is_molsight:
             detector = self._get_lightweight_detector()
             return detector.detect_structures_with_boxes(page_image)
         else:
@@ -126,6 +134,9 @@ class InferenceProvider:
         if self._settings.is_cloud:
             client = self._get_cloud_client()
             return client.predict_smiles(structure_image)
+        elif self._settings.is_molsight:
+            predictor = self._get_molsight_predictor()
+            return predictor.predict(structure_image)
         elif self._settings.is_lightweight:
             predictor = self._get_lightweight_predictor()
             return predictor.predict(structure_image, high_accuracy=high_accuracy)
@@ -151,6 +162,9 @@ class InferenceProvider:
         if self._settings.is_cloud:
             client = self._get_cloud_client()
             return client.predict_smiles_batch(structure_images)
+        elif self._settings.is_molsight:
+            predictor = self._get_molsight_predictor()
+            return predictor.predict_batch(structure_images)
         elif self._settings.is_lightweight:
             predictor = self._get_lightweight_predictor()
             return predictor.predict_batch(structure_images, high_accuracy=high_accuracy)
@@ -164,7 +178,11 @@ class InferenceProvider:
         Returns:
             Tuple of (is_available, status_message)
         """
-        if self._settings.is_cloud:
+        if self._settings.is_molsight:
+            predictor = self._get_molsight_predictor()
+            return predictor.check_availability()
+
+        elif self._settings.is_cloud:
             try:
                 client = self._get_cloud_client()
                 if client.health_check():
@@ -224,3 +242,6 @@ class InferenceProvider:
         if self._cloud_client is not None:
             self._cloud_client.close()
             self._cloud_client = None
+        if self._molsight_predictor is not None:
+            self._molsight_predictor.close()
+            self._molsight_predictor = None

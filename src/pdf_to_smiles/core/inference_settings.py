@@ -14,6 +14,7 @@ class InferenceMode(Enum):
     LOCAL_CPU = "cpu"                 # Local CPU via DECIMER (slow but works everywhere)
     LOCAL_GPU = "gpu"                 # Local GPU (requires NVIDIA + CUDA)
     CLOUD = "cloud"                   # Cloud GPU via Modal.com
+    MOLSIGHT = "molsight"             # MolSight (separate venv)
 
 
 def _auto_detect_best_mode() -> InferenceMode:
@@ -148,6 +149,12 @@ class InferenceSettings:
         """Check if using lightweight local inference (MolScribe + OpenCV)."""
         return self._mode == InferenceMode.LOCAL_LIGHTWEIGHT
 
+    @property
+    def is_molsight(self) -> bool:
+        """Check if using MolSight inference."""
+        return self._mode == InferenceMode.MOLSIGHT
+
+
     def _load_settings(self) -> None:
         """Load settings from config file."""
         try:
@@ -191,5 +198,7 @@ class InferenceSettings:
             return "Local GPU (CUDA)"
         elif self._mode == InferenceMode.LOCAL_LIGHTWEIGHT:
             return "Local Lightweight (MolScribe)"
+        elif self._mode == InferenceMode.MOLSIGHT:
+            return "MolSight (separate venv)"
         else:
             return "Local CPU (DECIMER, slow)"

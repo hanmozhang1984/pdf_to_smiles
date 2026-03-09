@@ -1,8 +1,15 @@
 """SMILES validation and 2D structure rendering using RDKit."""
 
+import re
 from typing import Optional, Tuple
 from PIL import Image
 import io
+
+# Pattern to strip extended stereo descriptors (@SP1, @TB4, @OH12, etc.)
+# These are valid SMILES but poorly supported outside RDKit (e.g. ChemDraw
+# renders them as garbled "tp4" labels).  Stripping them produces portable
+# canonical SMILES without changing molecular identity (confirmed via InChI).
+_EXTENDED_STEREO_RE = re.compile(r'@(?:SP[1-3]|TB\d{1,2}|OH\d{1,2})')
 
 
 class SMILESValidator:
@@ -54,8 +61,9 @@ class SMILESValidator:
             if mol is None:
                 return False, None
 
-            # Get canonical SMILES
+            # Get canonical SMILES and strip extended stereo descriptors
             canonical = Chem.MolToSmiles(mol, canonical=True)
+            canonical = _EXTENDED_STEREO_RE.sub('', canonical)
             return True, canonical
 
         except Exception:

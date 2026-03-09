@@ -74,7 +74,7 @@ class ExportHandler:
 
             # Write header - base columns + dynamic bio columns + custom columns
             headers = [
-                'Source_File', 'Compound_ID', 'Page', 'Structure', 'SMILES', 'Canonical_SMILES', 'Valid',
+                'Source_File', 'Compound_ID', 'Compound_Type', 'Page', 'Structure', 'SMILES', 'Canonical_SMILES', 'Valid',
                 'MW_Da', 'cLogP', 'TPSA', 'Rotatable_Bonds', 'Stereocenters',
                 'Molecular_Formula', 'Error'
             ]
@@ -91,6 +91,7 @@ class ExportHandler:
                 row = [
                     row_source,
                     result.compound_id or '',
+                    result.compound_type or '',
                     result.page_number,
                     result.structure_index + 1,  # 1-indexed for users
                     result.smiles or '',
@@ -171,6 +172,8 @@ class ExportHandler:
                 f.write(f"[{row_source}] Page {result.page_number}, Structure {result.structure_index + 1}\n")
                 if result.compound_id:
                     f.write(f"  Compound ID: {result.compound_id}\n")
+                if result.compound_type:
+                    f.write(f"  Compound Type: {result.compound_type}\n")
                 f.write(f"  SMILES: {result.smiles or 'N/A'}\n")
                 if result.canonical_smiles and result.canonical_smiles != result.smiles:
                     f.write(f"  Canonical: {result.canonical_smiles}\n")
@@ -280,6 +283,8 @@ class ExportHandler:
                     mol.SetProp("Source_File", row_source)
                 if result.compound_id:
                     mol.SetProp("Compound_ID", result.compound_id)
+                if result.compound_type:
+                    mol.SetProp("Compound_Type", result.compound_type)
                 mol.SetProp("Page_Number", str(result.page_number))
                 mol.SetProp("Structure_Index", str(result.structure_index + 1))
                 mol.SetProp("Original_SMILES", result.smiles or "")

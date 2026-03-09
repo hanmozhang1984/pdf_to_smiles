@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional, List
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -94,29 +95,57 @@ class LightweightPredictor:
         """Check if the model has been loaded."""
         return self._initialized
 
-    def predict(
-        self, structure_image: Image.Image, high_accuracy: bool = False
-    ) -> Optional[str]:
-        """Predict SMILES string from a chemical structure image.
+    @staticmethod
+    def _enhance_for_prediction(image: Image.Image, aggressive: bool = False) -> Image.Image:
+        """Enhance image contrast and clean background for better prediction.
 
         Args:
-            structure_image: PIL Image containing a single chemical structure.
-            high_accuracy: If True, apply preprocessing for better accuracy.
+            image: Cleaned PIL Image (after image_cleaner).
+            aggressive: If True, apply stronger preprocessing (used on retry).
 
         Returns:
-            Predicted SMILES string, or None if prediction fails.
+            Enhanced PIL Image with improved contrast.
         """
-        from pdf_to_smiles.core.image_cleaner import clean_structure_image
-        structure_image = clean_structure_image(structure_image, mask_text=self._mask_text)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        img = np.array(image)
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-        self._ensure_initialized()
+        if aggressive:
+            # Adaptive thresholding to handle uneven backgrounds
+            binary = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, blockSize=31, C=15
+            )
+        else:
+            # CLAHE for local contrast enhancement
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
 
+            # Whiten background: pixels above the Otsu threshold become pure white
+            thresh_val, _ = cv2.threshold(enhanced, 0, 255,
+                                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            binary = np.where(enhanced > thresh_val, 255, enhanced).astype(np.uint8)
+
+            # Stretch remaining ink to full contrast range
+            ink_pixels = binary[binary < 255]
+            if len(ink_pixels) > 0:
+                lo, hi = np.percentile(ink_pixels, [2, 98])
+                if hi > lo:
+                    binary = np.clip((binary.astype(float) - lo) / (hi - lo) * 200, 0, 255).astype(np.uint8)
+                    binary[binary > 200] = 255
+
+        # Convert back to RGB
+        result = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+        return Image.fromarray(result)
+
+    def _predict_single(self, img_array: np.ndarray) -> Optional[str]:
+        """Run MolScribe on a numpy RGB array, validate with RDKit.
+
+        Returns:
+            Valid SMILES string, or None.
+        """
         try:
-            # MolScribe expects numpy array (RGB)
-            if structure_image.mode != 'RGB':
-                structure_image = structure_image.convert('RGB')
-            img_array = np.array(structure_image)
-
             output = self._model.predict_image(img_array)
 
             if isinstance(output, dict):
@@ -128,17 +157,72 @@ class LightweightPredictor:
 
             if smiles and isinstance(smiles, str) and len(smiles.strip()) > 0:
                 result = smiles.strip()
-                # Always validate with RDKit — rejects garbage from non-structure inputs
                 if not self._is_valid_smiles(result):
                     return None
                 return result
             return None
-
-        except Exception as e:
-            import traceback
-            print(f"MolScribe prediction failed: {e}")
-            traceback.print_exc()
+        except Exception:
             return None
+
+    @staticmethod
+    def _is_connected(smiles: str) -> bool:
+        """Check if SMILES represents a single connected molecule (no '.')."""
+        return '.' not in smiles
+
+    def _predict_best(self, images: list[np.ndarray]) -> Optional[str]:
+        """Try multiple image variants and return the best SMILES.
+
+        Preference order:
+        1. Connected (no '.') SMILES from the earliest image variant
+        2. Disconnected SMILES as fallback (from the earliest variant)
+        """
+        best_disconnected = None
+        for img in images:
+            result = self._predict_single(img)
+            if result is None:
+                continue
+            if self._is_connected(result):
+                return result  # Connected — accept immediately
+            if best_disconnected is None:
+                best_disconnected = result  # Keep first disconnected as fallback
+        return best_disconnected
+
+    def predict(
+        self, structure_image: Image.Image, high_accuracy: bool = False
+    ) -> Optional[str]:
+        """Predict SMILES string from a chemical structure image.
+
+        Tries multiple preprocessing variants and prefers connected SMILES
+        (single molecule) over disconnected fragments.
+
+        Args:
+            structure_image: PIL Image containing a single chemical structure.
+            high_accuracy: If True, apply preprocessing for better accuracy.
+
+        Returns:
+            Predicted SMILES string, or None if prediction fails.
+        """
+        from pdf_to_smiles.core.image_cleaner import clean_structure_image
+        cleaned = clean_structure_image(structure_image, mask_text=self._mask_text)
+
+        self._ensure_initialized()
+
+        # Prepare all image variants
+        variants = []
+
+        # Variant 1: original cleaned (no enhancement) — safest for thin bonds
+        orig = cleaned.convert('RGB') if cleaned.mode != 'RGB' else cleaned
+        variants.append(np.array(orig))
+
+        # Variant 2: mild enhancement (CLAHE + background whitening)
+        enhanced = self._enhance_for_prediction(cleaned, aggressive=False)
+        variants.append(np.array(enhanced.convert('RGB')))
+
+        # Variant 3: aggressive preprocessing (adaptive threshold)
+        aggressive = self._enhance_for_prediction(cleaned, aggressive=True)
+        variants.append(np.array(aggressive.convert('RGB')))
+
+        return self._predict_best(variants)
 
     def predict_batch(
         self,
@@ -146,6 +230,9 @@ class LightweightPredictor:
         high_accuracy: bool = False
     ) -> List[Optional[str]]:
         """Predict SMILES for multiple structure images.
+
+        Uses batch prediction with original images first, then retries
+        failures/disconnected results with enhanced variants.
 
         Args:
             structure_images: List of PIL Images containing chemical structures.
@@ -155,44 +242,65 @@ class LightweightPredictor:
             List of predicted SMILES strings (None for failed predictions).
         """
         from pdf_to_smiles.core.image_cleaner import clean_structure_image
-        structure_images = [clean_structure_image(img, mask_text=self._mask_text) for img in structure_images]
+        cleaned_images = [clean_structure_image(img, mask_text=self._mask_text)
+                          for img in structure_images]
 
         self._ensure_initialized()
 
+        # First pass: batch predict with original cleaned images
         try:
-            # MolScribe expects numpy arrays (RGB)
             np_images = []
-            for img in structure_images:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                np_images.append(np.array(img))
+            for img in cleaned_images:
+                rgb = img.convert('RGB') if img.mode != 'RGB' else img
+                np_images.append(np.array(rgb))
 
             outputs = self._model.predict_images(np_images)
 
-            results = []
+            results: List[Optional[str]] = []
             for output in outputs:
+                smiles = None
                 if isinstance(output, dict):
                     smiles = output.get('smiles', '')
                 elif isinstance(output, str):
                     smiles = output
-                else:
-                    results.append(None)
-                    continue
 
                 if smiles and isinstance(smiles, str) and len(smiles.strip()) > 0:
                     result = smiles.strip()
-                    if not self._is_valid_smiles(result):
-                        results.append(None)
-                    else:
+                    if self._is_valid_smiles(result):
                         results.append(result)
+                    else:
+                        results.append(None)
                 else:
                     results.append(None)
 
-            return results
-
         except Exception:
-            # Fall back to one-by-one prediction
-            return [self.predict(img, high_accuracy) for img in structure_images]
+            results = [None] * len(structure_images)
+
+        # Retry failures and disconnected results with enhanced variants
+        for i, (r, cleaned) in enumerate(zip(results, cleaned_images)):
+            if r is None or not self._is_connected(r):
+                # Build variant images (skip original, already tried)
+                variants = []
+                mild = self._enhance_for_prediction(cleaned, aggressive=False)
+                variants.append(np.array(mild.convert('RGB')))
+                aggr = self._enhance_for_prediction(cleaned, aggressive=True)
+                variants.append(np.array(aggr.convert('RGB')))
+
+                for img in variants:
+                    candidate = self._predict_single(img)
+                    if candidate is not None and self._is_connected(candidate):
+                        results[i] = candidate
+                        break
+                else:
+                    # No connected result found; keep best disconnected
+                    if r is None:
+                        for img in variants:
+                            candidate = self._predict_single(img)
+                            if candidate is not None:
+                                results[i] = candidate
+                                break
+
+        return results
 
     @staticmethod
     def _is_valid_smiles(smiles: str) -> bool:

@@ -14,6 +14,7 @@ class InferenceMode(Enum):
     LOCAL_CPU = "cpu"                 # Local CPU via DECIMER (slow but works everywhere)
     LOCAL_GPU = "gpu"                 # Local GPU (requires NVIDIA + CUDA)
     CLOUD = "cloud"                   # Cloud GPU via Modal.com
+    MOLSIGHT = "molsight"             # MolSight (separate venv)
 
 
 def _auto_detect_best_mode() -> InferenceMode:
@@ -61,6 +62,7 @@ class InferenceSettings:
         self._cloud_endpoint: Optional[str] = None
         self._cloud_timeout: int = 300  # 5 minutes for cold starts
         self._auto_detect_pages: bool = True
+        self._anthropic_api_key: Optional[str] = None
         self._load_settings()
 
     @classmethod
@@ -115,6 +117,24 @@ class InferenceSettings:
         self._save_settings()
 
     @property
+    def anthropic_api_key(self) -> Optional[str]:
+        """Anthropic API key for LLM compound classification."""
+        return self._anthropic_api_key
+
+    @anthropic_api_key.setter
+    def anthropic_api_key(self, value: Optional[str]) -> None:
+        """Set Anthropic API key."""
+        self._anthropic_api_key = value if value else None
+        self._save_settings()
+
+    def apply_api_keys(self) -> None:
+        """Apply stored API keys to environment variables."""
+        if self._anthropic_api_key:
+            os.environ["ANTHROPIC_API_KEY"] = self._anthropic_api_key
+        elif "ANTHROPIC_API_KEY" not in os.environ:
+            pass  # Don't overwrite env var set externally
+
+    @property
     def is_cloud(self) -> bool:
         """Check if using cloud inference."""
         return self._mode == InferenceMode.CLOUD
@@ -128,6 +148,12 @@ class InferenceSettings:
     def is_lightweight(self) -> bool:
         """Check if using lightweight local inference (MolScribe + OpenCV)."""
         return self._mode == InferenceMode.LOCAL_LIGHTWEIGHT
+
+    @property
+    def is_molsight(self) -> bool:
+        """Check if using MolSight inference."""
+        return self._mode == InferenceMode.MOLSIGHT
+
 
     def _load_settings(self) -> None:
         """Load settings from config file."""
@@ -143,6 +169,7 @@ class InferenceSettings:
                     self._cloud_endpoint = data.get("cloud_endpoint")
                     self._cloud_timeout = data.get("cloud_timeout", 300)
                     self._auto_detect_pages = data.get("auto_detect_pages", True)
+                    self._anthropic_api_key = data.get("anthropic_api_key")
         except Exception:
             pass  # Use defaults if loading fails
 
@@ -151,12 +178,15 @@ class InferenceSettings:
         try:
             os.makedirs(os.path.dirname(self._config_file), exist_ok=True)
             with open(self._config_file, 'w') as f:
-                json.dump({
+                data = {
                     "mode": self._mode.value,
                     "cloud_endpoint": self._cloud_endpoint,
                     "cloud_timeout": self._cloud_timeout,
                     "auto_detect_pages": self._auto_detect_pages
-                }, f, indent=2)
+                }
+                if self._anthropic_api_key:
+                    data["anthropic_api_key"] = self._anthropic_api_key
+                json.dump(data, f, indent=2)
         except Exception:
             pass  # Ignore save errors
 
@@ -168,5 +198,7 @@ class InferenceSettings:
             return "Local GPU (CUDA)"
         elif self._mode == InferenceMode.LOCAL_LIGHTWEIGHT:
             return "Local Lightweight (MolScribe)"
+        elif self._mode == InferenceMode.MOLSIGHT:
+            return "MolSight (separate venv)"
         else:
             return "Local CPU (DECIMER, slow)"

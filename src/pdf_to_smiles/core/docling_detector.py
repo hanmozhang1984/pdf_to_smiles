@@ -40,15 +40,18 @@ class DoclingDetector:
     _STRUCTURE_INK_MIN_CELLS = 6  # min occupied cells in 4x4 grid
     _STRUCTURE_INK_CELL_THRESHOLD = 0.005  # min dark ratio per cell
 
+    # Minimum row height for a candidate structure cell (px at 200 DPI).
+    # Header rows are typically 40-110 px; real structure cells are 200+.
+    _MIN_STRUCTURE_ROW_HEIGHT = 160
+
     # Template matching — threshold is intentionally low because different
     # chemical structures have near-zero cross-correlation; we only want
     # to reject truly anti-correlated (inverted/blank) regions.
     _TEMPLATE_SIMILARITY_THRESHOLD = -0.3
 
-    # Keywords for table caption scanning
-    _TABLE_CAPTION_KEYWORDS = re.compile(
-        r"(?:example|compound|structure|table\s*\d)", re.IGNORECASE,
-    )
+    # Keyword for table caption/header scanning — only "structure" is safe;
+    # "example" and "table \d" also match text-only tables (TABLE 2, TABLE 3).
+    _TABLE_CAPTION_KEYWORDS = re.compile(r"structure", re.IGNORECASE)
 
     def __init__(self, docling_classifier):
         """Initialize with a DoclingClassifier that has cached layout data.
@@ -58,7 +61,7 @@ class DoclingDetector:
                 processed the PDF (layout clusters are cached).
         """
         self._classifier = docling_classifier
-        self._table_row_cache = None  # (avg_h, x_left, x_right, pitch, header_offset)
+        self._table_row_cache = None  # (x_left, x_right) — structure column X-range
         self._template_crop = None   # grayscale np.array of a known structure
 
     def detect_structures_with_boxes(
@@ -80,6 +83,8 @@ class DoclingDetector:
         boxes = self._merge_split_boxes(boxes)
         boxes = self._fill_table_gaps(boxes, page_image, page_num)
         boxes = self._scan_example_tables(boxes, page_image, page_num)
+        boxes = self._close_row_gaps(boxes, page_num, page_image.size)
+        boxes = self._split_compound_boxes(boxes, page_image, page_num)
         if not boxes:
             return []
 
@@ -236,6 +241,237 @@ class DoclingDetector:
 
         return table_boxes
 
+    # ------------------------------------------------------------------
+    # Line-based table boundary detection
+    # ------------------------------------------------------------------
+
+    _BOUNDARY_MERGE_PX = 15  # merge detected lines within this distance
+
+    @staticmethod
+    def _merge_close_boundaries(positions: List[int]) -> List[int]:
+        """Merge boundary positions that are within _BOUNDARY_MERGE_PX of each other.
+
+        When table border lines are detected separately from table edge
+        coordinates, they create tiny 2-3 px "segments".  This merges them
+        by averaging clusters of positions that are close together.
+        """
+        if len(positions) <= 1:
+            return list(positions)
+
+        merged: List[int] = []
+        cluster = [positions[0]]
+        for p in positions[1:]:
+            if p - cluster[-1] <= DoclingDetector._BOUNDARY_MERGE_PX:
+                cluster.append(p)
+            else:
+                merged.append(sum(cluster) // len(cluster))
+                cluster = [p]
+        merged.append(sum(cluster) // len(cluster))
+        return merged
+
+    def _detect_table_row_boundaries(
+        self, page_image: Image.Image,
+        tx1: int, ty1: int, tx2: int, ty2: int,
+    ) -> List[int]:
+        """Detect horizontal separator lines in a table region.
+
+        Returns sorted list of absolute Y-coordinates of row boundaries
+        (including table top and bottom edges).
+        """
+        gray = np.array(page_image.crop((tx1, ty1, tx2, ty2)).convert("L"))
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        h, w = binary.shape
+        kernel_len = max(w // 3, 80)
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+        h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+
+        projection = np.sum(h_lines > 0, axis=1)
+        threshold = max(1, w // 8)
+
+        positions: List[int] = []
+        in_line = False
+        start = 0
+        for i, val in enumerate(projection):
+            if val >= threshold:
+                if not in_line:
+                    start = i
+                    in_line = True
+            else:
+                if in_line:
+                    positions.append((start + i) // 2)
+                    in_line = False
+        if in_line:
+            positions.append((start + h) // 2)
+
+        abs_positions = sorted(set([ty1] + [ty1 + p for p in positions] + [ty2]))
+        merged = self._merge_close_boundaries(abs_positions)
+
+        # If any segment is too tall, subdivide using whitespace gaps.
+        # This handles tables without horizontal separator lines (e.g. GLP).
+        merged = self._subdivide_tall_segments(
+            page_image, tx1, tx2, merged,
+        )
+
+        return merged
+
+    # Maximum height (px) of a single row segment before we attempt
+    # whitespace-based subdivision.  At 200 DPI a single structure row
+    # is typically 300-450 px; 600 px safely avoids false splits.
+    _MAX_ROW_SEGMENT_HEIGHT = 600
+
+    # Minimum whitespace gap height (px) required to split a segment.
+    # Must be wide enough to avoid splitting within a row's internal
+    # spacing but narrow enough to catch actual inter-row gaps.
+    _MIN_WHITESPACE_GAP = 30
+
+    # Narrower gaps are accepted if the minimum density within the gap
+    # is effectively zero (< 0.5%).  This catches tables where inter-row
+    # whitespace is narrow but completely blank.
+    _NARROW_GAP_MIN = 15
+    _NARROW_GAP_DENSITY = 0.005
+
+    def _subdivide_tall_segments(
+        self,
+        page_image: Image.Image,
+        x1: int, x2: int,
+        row_bounds: List[int],
+    ) -> List[int]:
+        """Split row segments that are too tall using whitespace gap detection.
+
+        For each segment taller than _MAX_ROW_SEGMENT_HEIGHT, analyse the
+        horizontal ink-density profile and insert boundaries at large
+        whitespace gaps.  Returns the refined list of boundaries.
+        """
+        refined: List[int] = [row_bounds[0]]
+
+        for r in range(len(row_bounds) - 1):
+            seg_y1 = row_bounds[r]
+            seg_y2 = row_bounds[r + 1]
+            seg_h = seg_y2 - seg_y1
+
+            if seg_h <= self._MAX_ROW_SEGMENT_HEIGHT:
+                refined.append(seg_y2)
+                continue
+
+            # Compute per-row dark-pixel density inside segment
+            gray = np.array(
+                page_image.crop((x1, seg_y1, x2, seg_y2)).convert("L")
+            )
+            dark = gray < self._INK_DARK_THRESHOLD
+            row_density = np.mean(dark, axis=1).astype(np.float32)
+
+            # Smooth to avoid splitting on single blank scanlines
+            kernel_size = 15
+            kernel = np.ones(kernel_size) / kernel_size
+            smoothed = np.convolve(row_density, kernel, mode="same")
+
+            # Detect contiguous whitespace runs (density < 2%)
+            gap_thresh = 0.02
+            in_gap = False
+            gap_start = 0
+            gaps: List[Tuple[int, int]] = []  # (center_y_rel, width)
+            for i, val in enumerate(smoothed):
+                if val < gap_thresh:
+                    if not in_gap:
+                        gap_start = i
+                        in_gap = True
+                else:
+                    if in_gap:
+                        gap_w = i - gap_start
+                        min_density = float(smoothed[gap_start:i].min())
+                        # Accept wide gaps normally, or narrow gaps if
+                        # the density drops to near zero
+                        if (gap_w >= self._MIN_WHITESPACE_GAP
+                                or (gap_w >= self._NARROW_GAP_MIN
+                                    and min_density < self._NARROW_GAP_DENSITY)):
+                            gaps.append(((gap_start + i) // 2, gap_w))
+                        in_gap = False
+            if in_gap:
+                gap_w = len(smoothed) - gap_start
+                if gap_w >= self._MIN_WHITESPACE_GAP:
+                    gaps.append(((gap_start + len(smoothed)) // 2, gap_w))
+
+            if gaps:
+                for center, _ in gaps:
+                    refined.append(seg_y1 + center)
+                logger.debug(
+                    "_subdivide_tall_segments: split segment y=%d-%d (h=%d) "
+                    "into %d sub-segments via %d whitespace gaps",
+                    seg_y1, seg_y2, seg_h, len(gaps) + 1, len(gaps),
+                )
+
+            refined.append(seg_y2)
+
+        return sorted(set(refined))
+
+    def _detect_table_column_boundaries(
+        self, page_image: Image.Image,
+        tx1: int, ty1: int, tx2: int, ty2: int,
+    ) -> List[int]:
+        """Detect vertical separator lines in a table region.
+
+        Returns sorted list of absolute X-coordinates of column boundaries.
+        """
+        gray = np.array(page_image.crop((tx1, ty1, tx2, ty2)).convert("L"))
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        h, w = binary.shape
+        kernel_len = max(h // 3, 80)
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_len))
+        v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+
+        projection = np.sum(v_lines > 0, axis=0)
+        threshold = max(1, h // 8)
+
+        positions: List[int] = []
+        in_line = False
+        start = 0
+        for i, val in enumerate(projection):
+            if val >= threshold:
+                if not in_line:
+                    start = i
+                    in_line = True
+            else:
+                if in_line:
+                    positions.append((start + i) // 2)
+                    in_line = False
+        if in_line:
+            positions.append((start + w) // 2)
+
+        abs_positions = sorted(set([tx1] + [tx1 + p for p in positions] + [tx2]))
+        return self._merge_close_boundaries(abs_positions)
+
+    def _identify_structure_column(
+        self, col_boundaries: List[int],
+        boxes: List[Tuple], inside_idxs: List[int],
+    ) -> Tuple[int, int]:
+        """Return (x_left, x_right) of the structure column."""
+        if inside_idxs:
+            mid_xs = [(boxes[i][0] + boxes[i][2]) / 2 for i in inside_idxs]
+            avg_mid = sum(mid_xs) / len(mid_xs)
+            for k in range(len(col_boundaries) - 1):
+                if col_boundaries[k] <= avg_mid <= col_boundaries[k + 1]:
+                    return col_boundaries[k], col_boundaries[k + 1]
+
+        # Fallback: use cached column range
+        if self._table_row_cache is not None:
+            cached_x_left, cached_x_right = self._table_row_cache
+            cached_mid = (cached_x_left + cached_x_right) / 2
+            for k in range(len(col_boundaries) - 1):
+                if col_boundaries[k] <= cached_mid <= col_boundaries[k + 1]:
+                    return col_boundaries[k], col_boundaries[k + 1]
+
+        # Fallback: second column (patent tables are always
+        # Example | Structure | Name | ...).  Border-artifact columns
+        # have been merged away by _merge_close_boundaries so index 1
+        # reliably points to the Structure column.
+        if len(col_boundaries) >= 3:
+            return col_boundaries[1], col_boundaries[2]
+
+        # Last resort: full table width
+        return col_boundaries[0], col_boundaries[-1]
+
     def _fill_table_gaps(
         self,
         boxes: List[Tuple[int, int, int, int]],
@@ -244,11 +480,9 @@ class DoclingDetector:
     ) -> List[Tuple[int, int, int, int]]:
         """Fill missed structure rows inside Docling-detected tables.
 
-        When at least one structure box falls inside a table region, compute
-        the expected row grid and synthesise candidate boxes for rows that
-        have no detection.  The grid is anchored on detected structures and
-        uses row pitch (distance between consecutive row starts) rather than
-        structure height, since rows have inter-row gaps.
+        Uses horizontal/vertical line detection to find actual cell boundaries
+        rather than walking a rigid averaged-pitch grid.  Falls back to the
+        old pitch-based approach when fewer than 3 horizontal lines are found.
 
         Returns the original boxes plus any validated synthetic boxes.
         """
@@ -270,89 +504,62 @@ class DoclingDetector:
             if not inside_idxs:
                 continue
 
-            # Compute average structure height and X-span
-            heights = [boxes[i][3] - boxes[i][1] for i in inside_idxs]
-            avg_h = sum(heights) / len(heights)
-            if avg_h < 10:
-                continue
+            # Detect row/column boundaries from separator lines
+            row_bounds = self._detect_table_row_boundaries(
+                page_image, tx1, ty1, tx2, ty2,
+            )
+            col_bounds = self._detect_table_column_boundaries(
+                page_image, tx1, ty1, tx2, ty2,
+            )
 
-            x_left = min(boxes[i][0] for i in inside_idxs)
-            x_right = max(boxes[i][2] for i in inside_idxs)
+            # Fallback: if line detection found too few rows, use pitch-based
+            if len(row_bounds) < 3:
+                row_bounds = self._pitch_fallback_rows(
+                    boxes, inside_idxs, ty1, ty2,
+                )
 
-            # Compute row pitch from consecutive detected y1 values
-            sorted_y1s = sorted(boxes[i][1] for i in inside_idxs)
+            # Identify structure column
+            x_left, x_right = self._identify_structure_column(
+                col_bounds, boxes, inside_idxs,
+            )
 
-            if len(sorted_y1s) >= 2:
-                intervals = [sorted_y1s[j + 1] - sorted_y1s[j]
-                             for j in range(len(sorted_y1s) - 1)]
-                pitch = sum(intervals) / len(intervals)
-            elif self._table_row_cache is not None:
-                pitch = self._table_row_cache[3]
-            else:
-                pitch = avg_h  # fallback when no cache and only 1 detection
-
-            # Anchor on the first detected structure and walk up to find
-            # the first data-row start within the table
-            anchor_y = sorted_y1s[0]
-            first_row_y = anchor_y
-            while first_row_y - pitch >= ty1:
-                first_row_y -= pitch
-
-            header_offset = first_row_y - ty1
-
-            # Cache for cross-page rescue
-            self._table_row_cache = (avg_h, x_left, x_right, pitch, header_offset)
+            # Cache structure column X-range for cross-page rescue
+            self._table_row_cache = (x_left, x_right)
             self._template_crop = np.array(
                 page_image.crop(boxes[inside_idxs[0]]).convert("L")
             )
 
-            # Walk the grid from first_row_y by pitch
-            y_cursor = first_row_y
-            while y_cursor + avg_h <= ty2 + avg_h * 0.5:
-                row_cy = y_cursor + avg_h / 2
+            # Skip the header row (first segment) — data rows start from
+            # the second row segment onward
+            data_start = 1 if len(row_bounds) > 2 else 0
 
-                # Check if any existing box already covers this row center
+            for r in range(data_start, len(row_bounds) - 1):
+                cand_y1 = row_bounds[r]
+                cand_y2 = row_bounds[r + 1]
+                cand_x1 = max(0, x_left)
+                cand_x2 = min(page_image.size[0], x_right)
+
+                if cand_x2 - cand_x1 < 10 or cand_y2 - cand_y1 < self._MIN_STRUCTURE_ROW_HEIGHT:
+                    continue
+
+                # Check if any existing box already covers this row
+                row_cy = (cand_y1 + cand_y2) / 2
+                x_mid = (cand_x1 + cand_x2) / 2
                 covered = False
                 for bx1, by1, bx2, by2 in new_boxes:
-                    if by1 <= row_cy <= by2 and bx1 <= (x_left + x_right) / 2 <= bx2:
+                    if by1 <= row_cy <= by2 and bx1 <= x_mid <= bx2:
                         covered = True
                         break
 
                 if not covered:
-                    cand_y1 = int(y_cursor)
-                    cand_y2 = int(y_cursor + avg_h)
-
-                    # Snap to the nearest detected box above: if a detected
-                    # box ends just before this row, use its y2 as our y1
-                    # so uneven pitch doesn't truncate the structure top.
-                    for bx1, by1, bx2, by2 in new_boxes:
-                        gap = cand_y1 - by2
-                        if 0 < gap < pitch * 0.3:
-                            cand_y1 = by2
-                            break
-
-                    # Extend to the next grid line or table bottom so we
-                    # fill the full row rather than using rigid avg_h
-                    next_grid = int(y_cursor + pitch)
-                    cand_y2 = min(next_grid, ty2)
-
-                    # Clamp to table and image boundaries
-                    cand_y1 = max(0, max(cand_y1, ty1))
-                    cand_y2 = min(page_image.size[1], cand_y2)
-                    cand_x1 = max(0, max(int(x_left), tx1))
-                    cand_x2 = min(page_image.size[0], min(int(x_right), tx2))
-
-                    if cand_x2 - cand_x1 >= 10 and cand_y2 - cand_y1 >= 10:
-                        if self._validate_candidate(
-                            page_image, cand_x1, cand_y1, cand_x2, cand_y2,
-                        ):
-                            new_boxes.append((cand_x1, cand_y1, cand_x2, cand_y2))
-                            logger.debug(
-                                "_fill_table_gaps: added synthetic box (%d,%d,%d,%d) on page %d",
-                                cand_x1, cand_y1, cand_x2, cand_y2, page_num,
-                            )
-
-                y_cursor += pitch
+                    if self._validate_candidate(
+                        page_image, cand_x1, cand_y1, cand_x2, cand_y2,
+                    ):
+                        new_boxes.append((cand_x1, cand_y1, cand_x2, cand_y2))
+                        logger.debug(
+                            "_fill_table_gaps: added synthetic box (%d,%d,%d,%d) on page %d",
+                            cand_x1, cand_y1, cand_x2, cand_y2, page_num,
+                        )
 
         if len(new_boxes) > len(boxes):
             logger.debug(
@@ -361,6 +568,44 @@ class DoclingDetector:
             )
 
         return new_boxes
+
+    @staticmethod
+    def _pitch_fallback_rows(
+        boxes: List[Tuple[int, int, int, int]],
+        inside_idxs: List[int],
+        ty1: int, ty2: int,
+    ) -> List[int]:
+        """Compute row boundaries using averaged pitch when line detection fails."""
+        heights = [boxes[i][3] - boxes[i][1] for i in inside_idxs]
+        avg_h = sum(heights) / len(heights)
+        if avg_h < 10:
+            return [ty1, ty2]
+
+        sorted_y1s = sorted(boxes[i][1] for i in inside_idxs)
+
+        if len(sorted_y1s) >= 2:
+            intervals = [sorted_y1s[j + 1] - sorted_y1s[j]
+                         for j in range(len(sorted_y1s) - 1)]
+            pitch = sum(intervals) / len(intervals)
+        else:
+            pitch = avg_h
+
+        # Walk up from first detection to find first row start
+        first_row_y = sorted_y1s[0]
+        while first_row_y - pitch >= ty1:
+            first_row_y -= pitch
+
+        # Build row boundaries
+        rows = [int(first_row_y)]
+        y = first_row_y + pitch
+        while y < ty2 + pitch * 0.3:
+            rows.append(int(min(y, ty2)))
+            y += pitch
+
+        if rows[-1] < ty2:
+            rows.append(ty2)
+
+        return sorted(set([ty1] + rows))
 
     # ------------------------------------------------------------------
     # Post-processing: rescue tables with 0 detections
@@ -376,9 +621,9 @@ class DoclingDetector:
 
         For each table region that has no structure boxes inside it:
         1. OCR a strip above the table to check for relevant keywords
-        2. Use cached row dimensions (or estimate from table size) to
-           walk the table and synthesise candidate boxes
-        3. Validate each candidate with _has_structure_ink + template matching
+        2. Detect row/column boundaries via separator lines
+        3. Identify structure column (cached X-range or pick 2nd column)
+        4. Validate each candidate with _has_structure_ink + template matching
 
         Returns original boxes plus any validated synthetic boxes.
         """
@@ -401,9 +646,10 @@ class DoclingDetector:
             if has_structures:
                 continue
 
-            # OCR a strip above the table to look for caption keywords
+            # OCR the caption above the table plus the table header/subtitle
+            # to check for "Structure" keyword.
             caption_y1 = max(0, ty1 - 80)
-            caption_y2 = ty1
+            caption_y2 = min(page_image.size[1], ty1 + 120)
             if caption_y2 - caption_y1 < 5:
                 continue
 
@@ -432,72 +678,82 @@ class DoclingDetector:
                 page_num, caption_text.strip(),
             )
 
-            # Determine row dimensions
-            table_h = ty2 - ty1
-            if self._table_row_cache is not None:
-                avg_h, x_left, x_right, cached_pitch, header_offset = self._table_row_cache
-                # Adjust X-span to this table's bounds
-                x_left = max(x_left, tx1)
-                x_right = min(x_right, tx2)
-                # Recalibrate pitch to this table's actual height to avoid
-                # cumulative drift from cross-page dimension differences
-                usable_h = table_h - header_offset
-                est_rows = max(1, round(usable_h / cached_pitch))
-                pitch = usable_h / est_rows
-            else:
-                # Standalone fallback: estimate from table dimensions
-                header_offset = int(table_h * 0.07)
-                usable_h = table_h - header_offset
-                # Target ~400px per row at 200 DPI
-                est_rows = max(2, min(6, round(usable_h / 400)))
-                pitch = usable_h / est_rows
-                avg_h = pitch * 0.9  # structures are ~90% of row pitch
-                if avg_h < 10:
-                    continue
-                # Use full table width with small margins
+            # Detect row/column boundaries from separator lines
+            row_bounds = self._detect_table_row_boundaries(
+                page_image, tx1, ty1, tx2, ty2,
+            )
+            col_bounds = self._detect_table_column_boundaries(
+                page_image, tx1, ty1, tx2, ty2,
+            )
+
+            # Fallback: if line detection found too few rows, use pitch estimate
+            if len(row_bounds) < 3:
+                table_h = ty2 - ty1
+                if self._table_row_cache is not None:
+                    # Use cached structure column width to estimate pitch
+                    cached_x_left, cached_x_right = self._table_row_cache
+                    header_offset = int(table_h * 0.07)
+                    usable_h = table_h - header_offset
+                    est_rows = max(2, min(6, round(usable_h / 400)))
+                    pitch = usable_h / est_rows
+                else:
+                    header_offset = int(table_h * 0.07)
+                    usable_h = table_h - header_offset
+                    est_rows = max(2, min(6, round(usable_h / 400)))
+                    pitch = usable_h / est_rows
+
+                row_bounds = [ty1 + header_offset]
+                y = ty1 + header_offset + pitch
+                while y < ty2 + pitch * 0.3:
+                    row_bounds.append(int(min(y, ty2)))
+                    y += pitch
+                if row_bounds[-1] < ty2:
+                    row_bounds.append(ty2)
+                row_bounds = sorted(set([ty1] + row_bounds))
+
+            # Identify structure column
+            x_left, x_right = self._identify_structure_column(
+                col_bounds, boxes, [],
+            )
+
+            # If no cache yet, use full table width with margins as fallback
+            if self._table_row_cache is None and len(col_bounds) < 3:
                 margin = int((tx2 - tx1) * 0.05)
                 x_left = tx1 + margin
                 x_right = tx2 - margin
 
-            # Walk table Y-range starting after header
-            y_cursor = ty1 + header_offset
-            while y_cursor + avg_h <= ty2 + avg_h * 0.5:
-                cand_y1 = int(y_cursor)
-                next_grid = int(y_cursor + pitch)
-                cand_y2 = min(next_grid, ty2)
-                cand_x1 = max(0, int(x_left))
-                cand_x2 = min(page_image.size[0], int(x_right))
+            # Cache structure column X-range for subsequent pages
+            self._table_row_cache = (x_left, x_right)
 
-                # Snap to nearest box above to avoid truncation
+            # Skip the header row
+            data_start = 1 if len(row_bounds) > 2 else 0
+
+            for r in range(data_start, len(row_bounds) - 1):
+                cand_y1 = row_bounds[r]
+                cand_y2 = row_bounds[r + 1]
+                cand_x1 = max(0, x_left)
+                cand_x2 = min(page_image.size[0], x_right)
+
+                if cand_x2 - cand_x1 < 10 or cand_y2 - cand_y1 < self._MIN_STRUCTURE_ROW_HEIGHT:
+                    continue
+
+                # Check not already covered
+                row_cy = (cand_y1 + cand_y2) / 2
+                x_mid = (cand_x1 + cand_x2) / 2
+                covered = False
                 for bx1, by1, bx2, by2 in new_boxes:
-                    gap = cand_y1 - by2
-                    if 0 < gap < pitch * 0.3:
-                        cand_y1 = by2
+                    if by1 <= row_cy <= by2 and bx1 <= x_mid <= bx2:
+                        covered = True
                         break
 
-                cand_y1 = max(0, cand_y1)
-                cand_y2 = min(page_image.size[1], cand_y2)
-
-                if cand_x2 - cand_x1 >= 10 and cand_y2 - cand_y1 >= 10:
-                    # Check not already covered
-                    row_cy = y_cursor + avg_h / 2
-                    x_mid = (cand_x1 + cand_x2) / 2
-                    covered = False
-                    for bx1, by1, bx2, by2 in new_boxes:
-                        if by1 <= row_cy <= by2 and bx1 <= x_mid <= bx2:
-                            covered = True
-                            break
-
-                    if not covered and self._validate_candidate(
-                        page_image, cand_x1, cand_y1, cand_x2, cand_y2,
-                    ):
-                        new_boxes.append((cand_x1, cand_y1, cand_x2, cand_y2))
-                        logger.debug(
-                            "_scan_example_tables: added synthetic box (%d,%d,%d,%d) on page %d",
-                            cand_x1, cand_y1, cand_x2, cand_y2, page_num,
-                        )
-
-                y_cursor += pitch
+                if not covered and self._validate_candidate(
+                    page_image, cand_x1, cand_y1, cand_x2, cand_y2,
+                ):
+                    new_boxes.append((cand_x1, cand_y1, cand_x2, cand_y2))
+                    logger.debug(
+                        "_scan_example_tables: added synthetic box (%d,%d,%d,%d) on page %d",
+                        cand_x1, cand_y1, cand_x2, cand_y2, page_num,
+                    )
 
         if len(new_boxes) > len(boxes):
             logger.debug(
@@ -506,6 +762,236 @@ class DoclingDetector:
             )
 
         return new_boxes
+
+    # ------------------------------------------------------------------
+    # Post-processing: close inter-row gaps to include example numbers
+    # ------------------------------------------------------------------
+
+    def _close_row_gaps(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        page_num: int,
+        page_image_size: Tuple[int, int],
+    ) -> List[Tuple[int, int, int, int]]:
+        """Expand box tops upward to close small gaps between consecutive rows.
+
+        Inside table regions, example numbers (e.g. "74") sit in the gap
+        between the previous row's bottom and the current row's top.  This
+        pass extends each box's y1 upward to the previous box's y2 so that
+        the example number line is included in the crop.
+
+        Returns a new list of boxes (original boxes outside tables are unchanged).
+        """
+        table_boxes = self._get_table_boxes(page_num, page_image_size)
+        if not table_boxes or not boxes:
+            return boxes
+
+        result = list(boxes)
+
+        for tx1, ty1, tx2, ty2 in table_boxes:
+            # Collect indices of boxes whose center falls inside this table
+            inside = []
+            for i, (bx1, by1, bx2, by2) in enumerate(result):
+                cx = (bx1 + bx2) / 2
+                cy = (by1 + by2) / 2
+                if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
+                    inside.append(i)
+
+            if len(inside) < 2:
+                continue
+
+            # Sort by y1
+            inside.sort(key=lambda i: result[i][1])
+
+            # For each consecutive pair, close the gap
+            for k in range(1, len(inside)):
+                prev_idx = inside[k - 1]
+                curr_idx = inside[k]
+                prev_y2 = result[prev_idx][3]
+                curr_x1, curr_y1, curr_x2, curr_y2 = result[curr_idx]
+                gap = curr_y1 - prev_y2
+
+                if 0 < gap < 80:  # small gap likely containing example number
+                    result[curr_idx] = (curr_x1, prev_y2, curr_x2, curr_y2)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Post-processing: split compound boxes (tall or wide)
+    # ------------------------------------------------------------------
+
+    # Wide boxes outside tables with aspect ratio > this trigger vertical split
+    _WIDE_BOX_ASPECT_RATIO = 2.5
+    # After splitting a wide box, reject if either sub-box exceeds this ratio
+    _WIDE_SPLIT_MAX_ASPECT = 3.0
+    # Minimum height for wide-box splitting candidates
+    _WIDE_BOX_MIN_HEIGHT = 150
+
+    def _split_compound_boxes(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        page_image: Image.Image,
+        page_num: int,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Split boxes that contain two structures (diastereomer pairs or side-by-side).
+
+        Two cases:
+        1. Tall boxes (height > _MAX_ROW_SEGMENT_HEIGHT): split horizontally
+           at the deepest whitespace gap in the middle 60%.
+        2. Wide boxes outside tables (aspect ratio > 2.5): split vertically
+           at the deepest whitespace gap in the middle 60%.
+
+        Both sub-boxes must pass validation; otherwise the original is kept.
+        """
+        table_boxes = self._get_table_boxes(page_num, page_image.size)
+        result: List[Tuple[int, int, int, int]] = []
+
+        for box in boxes:
+            x1, y1, x2, y2 = box
+            bw = x2 - x1
+            bh = y2 - y1
+
+            # --- Case 1: Tall box → horizontal split ---
+            if bh > self._MAX_ROW_SEGMENT_HEIGHT:
+                split = self._try_horizontal_split(page_image, x1, y1, x2, y2)
+                if split is not None:
+                    result.extend(split)
+                    logger.debug(
+                        "_split_compound_boxes: page %d tall box (%d,%d,%d,%d) h=%d → split into 2",
+                        page_num, x1, y1, x2, y2, bh,
+                    )
+                    continue
+
+            # --- Case 2: Wide box outside tables → vertical split ---
+            if (bh >= self._WIDE_BOX_MIN_HEIGHT
+                    and bw / max(bh, 1) > self._WIDE_BOX_ASPECT_RATIO
+                    and not self._box_inside_any_table(box, table_boxes)):
+                split = self._try_vertical_split(page_image, x1, y1, x2, y2)
+                if split is not None:
+                    result.extend(split)
+                    logger.debug(
+                        "_split_compound_boxes: page %d wide box (%d,%d,%d,%d) ratio=%.1f → split into 2",
+                        page_num, x1, y1, x2, y2, bw / max(bh, 1),
+                    )
+                    continue
+
+            result.append(box)
+
+        return result
+
+    def _try_horizontal_split(
+        self, page_image: Image.Image,
+        x1: int, y1: int, x2: int, y2: int,
+    ) -> Optional[List[Tuple[int, int, int, int]]]:
+        """Try to split a tall box at its deepest horizontal whitespace gap.
+
+        Returns two boxes if split succeeds, or None if it should be kept as-is.
+        """
+        bh = y2 - y1
+        gray = np.array(page_image.crop((x1, y1, x2, y2)).convert("L"))
+        dark = gray < self._INK_DARK_THRESHOLD
+        row_density = np.mean(dark, axis=1).astype(np.float32)
+
+        # Smooth
+        kernel_size = 15
+        kernel = np.ones(kernel_size) / kernel_size
+        smoothed = np.convolve(row_density, kernel, mode="same")
+
+        # Search in the middle 60% of the box
+        margin = int(bh * 0.2)
+        search_start = margin
+        search_end = bh - margin
+        if search_end <= search_start:
+            return None
+
+        region = smoothed[search_start:search_end]
+        min_idx = int(np.argmin(region)) + search_start
+        min_density = float(smoothed[min_idx])
+
+        if min_density >= 0.02:
+            return None
+
+        split_y = y1 + min_idx
+        box_a = (x1, y1, x2, split_y)
+        box_b = (x1, split_y, x2, y2)
+
+        # Both sub-boxes must have sufficient height
+        if (split_y - y1 < self._MIN_STRUCTURE_ROW_HEIGHT
+                or y2 - split_y < self._MIN_STRUCTURE_ROW_HEIGHT):
+            return None
+
+        # Both sub-boxes must pass structure ink validation
+        if (self._has_structure_ink(page_image, *box_a)
+                and self._has_structure_ink(page_image, *box_b)):
+            return [box_a, box_b]
+
+        return None
+
+    def _try_vertical_split(
+        self, page_image: Image.Image,
+        x1: int, y1: int, x2: int, y2: int,
+    ) -> Optional[List[Tuple[int, int, int, int]]]:
+        """Try to split a wide box at its deepest vertical whitespace gap.
+
+        Returns two boxes if split succeeds, or None if it should be kept as-is.
+        """
+        bw = x2 - x1
+        bh = y2 - y1
+        gray = np.array(page_image.crop((x1, y1, x2, y2)).convert("L"))
+        dark = gray < self._INK_DARK_THRESHOLD
+        col_density = np.mean(dark, axis=0).astype(np.float32)
+
+        # Smooth
+        kernel_size = 15
+        kernel = np.ones(kernel_size) / kernel_size
+        smoothed = np.convolve(col_density, kernel, mode="same")
+
+        # Search in the middle 60%
+        margin = int(bw * 0.2)
+        search_start = margin
+        search_end = bw - margin
+        if search_end <= search_start:
+            return None
+
+        region = smoothed[search_start:search_end]
+        min_idx = int(np.argmin(region)) + search_start
+        min_density = float(smoothed[min_idx])
+
+        if min_density >= 0.02:
+            return None
+
+        split_x = x1 + min_idx
+        box_a = (x1, y1, split_x, y2)
+        box_b = (split_x, y1, x2, y2)
+
+        # Safety: both sub-boxes must have aspect ratio < _WIDE_SPLIT_MAX_ASPECT
+        for bx1, by1, bx2, by2 in [box_a, box_b]:
+            sub_w = bx2 - bx1
+            sub_h = by2 - by1
+            if sub_w < 10 or sub_h < 10:
+                return None
+            if sub_w / max(sub_h, 1) > self._WIDE_SPLIT_MAX_ASPECT:
+                return None
+
+        # Both sub-boxes must have structure ink
+        if (self._has_structure_ink(page_image, *box_a)
+                and self._has_structure_ink(page_image, *box_b)):
+            return [box_a, box_b]
+
+        return None
+
+    @staticmethod
+    def _box_inside_any_table(
+        box: Tuple[int, int, int, int],
+        table_boxes: List[Tuple[int, int, int, int]],
+    ) -> bool:
+        """Check if a box's center falls inside any table region."""
+        cx = (box[0] + box[2]) / 2
+        cy = (box[1] + box[3]) / 2
+        for tx1, ty1, tx2, ty2 in table_boxes:
+            if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Ink and structure validation helpers

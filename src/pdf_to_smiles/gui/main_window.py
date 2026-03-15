@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QProgressBar,
     QFileDialog, QMessageBox, QHeaderView, QApplication, QGroupBox,
     QToolBar, QStatusBar, QInputDialog, QMenu, QLineEdit, QDialog,
-    QDialogButtonBox, QCheckBox
+    QDialogButtonBox
 )
 from PySide6.QtCore import Qt, Slot, QUrl
 from PySide6.QtGui import QPixmap, QImage, QAction, QIcon, QColor
@@ -78,7 +78,7 @@ class AutoTypeTableWidgetItem(QTableWidgetItem):
 from PIL import Image
 
 from ..models.extraction_result import ExtractionResult, ProcessingProgress, PDFInfo
-from ..workers.processing_worker import ProcessingWorker, parse_page_range
+from ..workers.processing_worker import ProcessingWorker
 from ..core.export_handler import ExportHandler
 from ..core.pdf_processor import PDFProcessor
 from ..core.inference_settings import InferenceSettings, InferenceMode
@@ -407,58 +407,6 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(custom_group)
 
-        # Processing Settings group
-        settings_group = QGroupBox("Processing")
-        settings_layout = QVBoxLayout(settings_group)
-        settings_layout.setSpacing(2)
-        settings_layout.setContentsMargins(4, 8, 4, 4)
-
-        self._chk_high_accuracy = QCheckBox("High Accuracy Mode")
-        self._chk_high_accuracy.setToolTip(
-            "Use higher resolution and image preprocessing for complex structures.\n"
-            "Recommended for macrocycles and detailed structures.\n"
-            "Processing will be slower."
-        )
-        settings_layout.addWidget(self._chk_high_accuracy)
-
-        # Page range selection
-        page_range_label = QLabel("Pages to process:")
-        settings_layout.addWidget(page_range_label)
-
-        self._txt_page_range = QLineEdit()
-        self._txt_page_range.setPlaceholderText("All pages (e.g., 45-52, 120-125)")
-        self._txt_page_range.setFixedHeight(22)
-        self._txt_page_range.setToolTip(
-            "Specify which pages to process.\n"
-            "Formats: 1-10, 5,8,12, or 1-5, 20-25\n"
-            "Leave blank to process all pages."
-        )
-        settings_layout.addWidget(self._txt_page_range)
-
-        detect_row = QHBoxLayout()
-
-        self._btn_detect_pages = QPushButton("Detect Pages")
-        self._btn_detect_pages.setFixedHeight(22)
-        self._btn_detect_pages.setToolTip(
-            "Scan the PDF to auto-detect pages containing\n"
-            "chemical structures or biological data tables."
-        )
-        self._btn_detect_pages.clicked.connect(self._on_detect_pages)
-        self._btn_detect_pages.setEnabled(False)
-        detect_row.addWidget(self._btn_detect_pages)
-
-        self._chk_auto_detect = QCheckBox("Auto-detect")
-        self._chk_auto_detect.setChecked(self._get_auto_detect_setting())
-        self._chk_auto_detect.setToolTip(
-            "Automatically skip text-only pages before processing.\n"
-            "Fast: ~0.1 sec/page."
-        )
-        detect_row.addWidget(self._chk_auto_detect)
-
-        settings_layout.addLayout(detect_row)
-
-        layout.addWidget(settings_group)
-
         # Inference Settings group
         inference_group = QGroupBox("Inference")
         inference_layout = QVBoxLayout(inference_group)
@@ -613,9 +561,6 @@ class MainWindow(QMainWindow):
         self._btn_check_all.setEnabled(has_results and not is_processing)
         self._btn_uncheck_all.setEnabled(has_results and not is_processing)
         self._btn_move_checked_top.setEnabled(has_results and not is_processing)
-
-        # Detect pages button
-        self._btn_detect_pages.setEnabled(has_pdfs and not is_processing)
 
         # Search buttons
         self._btn_search.setEnabled(has_results and not is_processing)
@@ -929,7 +874,6 @@ class MainWindow(QMainWindow):
         self._pdf_infos.clear()
         self._results.clear()
         self._table.setRowCount(0)
-        self._txt_page_range.clear()
         # Remove bio columns and custom columns
         while self._table.columnCount() > self._base_column_count:
             self._table.removeColumn(self._table.columnCount() - 1)
@@ -941,104 +885,6 @@ class MainWindow(QMainWindow):
         self._update_summary()
         self._update_button_states()
         self._statusbar.showMessage("Cleared all files and results")
-
-    @Slot()
-    def _on_detect_pages(self) -> None:
-        """Run fast visual page detection to find pages with structures/bio data."""
-        if not self._pdf_infos:
-            return
-
-        from ..core.page_classifier import PageClassifier
-        from ..core.patent_section_detector import PatentSectionDetector
-
-        self._btn_detect_pages.setEnabled(False)
-        self._btn_detect_pages.setText("Scanning...")
-        self._statusbar.showMessage("Detecting patent sections...")
-        QApplication.processEvents()
-
-        try:
-            detector = PatentSectionDetector()
-            classifier = PageClassifier()
-            all_detected = set()
-            section_info = ""
-
-            for info in self._pdf_infos:
-                # Step 1: Patent section detection (fast)
-                self._statusbar.showMessage(
-                    f"Detecting sections in {info.file_name}..."
-                )
-                QApplication.processEvents()
-
-                section_bounds = detector.detect(info.file_path)
-                section_pages = section_bounds.get_page_range() if section_bounds.is_valid else set()
-
-                if section_bounds.is_valid:
-                    section_info = (
-                        f"Examples section: pages {section_bounds.examples_start}"
-                        f"-{section_bounds.examples_end}"
-                    )
-
-                # Step 2: Visual page classifier
-                def progress_cb(current, total, _info=info):
-                    self._btn_detect_pages.setText(f"Page {current}/{total}")
-                    self._statusbar.showMessage(
-                        f"Scanning {_info.file_name}: page {current}/{total}..."
-                    )
-                    QApplication.processEvents()
-
-                detected = set(classifier.detect_structure_pages(
-                    info.file_path, progress_callback=progress_cb
-                ))
-
-                # Intersect with section bounds if available
-                if detected and section_pages:
-                    detected = detected & section_pages
-                elif section_pages and not detected:
-                    detected = section_pages
-
-                all_detected.update(detected)
-
-            # Format detected pages as compact range string
-            if all_detected:
-                range_str = self._format_page_set(all_detected)
-                self._txt_page_range.setText(range_str)
-                status = f"Detected {len(all_detected)} pages with structures/data"
-                if section_info:
-                    status += f" ({section_info})"
-                self._statusbar.showMessage(status)
-            else:
-                self._txt_page_range.clear()
-                self._statusbar.showMessage("No structure pages detected")
-
-        except Exception as e:
-            QMessageBox.warning(self, "Detection Error", f"Page detection failed: {e}")
-            self._statusbar.showMessage("Page detection failed")
-        finally:
-            self._btn_detect_pages.setText("Detect Pages")
-            self._btn_detect_pages.setEnabled(True)
-
-    @staticmethod
-    def _format_page_set(pages: set) -> str:
-        """Format a set of page numbers into a compact range string.
-
-        E.g., {1,2,3,5,8,9,10} -> "1-3, 5, 8-10"
-        """
-        if not pages:
-            return ""
-        sorted_pages = sorted(pages)
-        ranges = []
-        start = sorted_pages[0]
-        end = start
-
-        for page in sorted_pages[1:]:
-            if page == end + 1:
-                end = page
-            else:
-                ranges.append(f"{start}-{end}" if end > start else str(start))
-                start = end = page
-
-        ranges.append(f"{start}-{end}" if end > start else str(start))
-        return ", ".join(ranges)
 
     @Slot()
     def _on_extract(self) -> None:
@@ -1055,29 +901,12 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(0)
         self._lbl_status.setVisible(True)
 
-        # Parse page range
-        page_range_text = self._txt_page_range.text().strip()
-        page_filter = None
-        if page_range_text:
-            try:
-                max_pages = max(info.page_count for info in self._pdf_infos)
-                page_filter = parse_page_range(page_range_text, max_pages)
-            except ValueError as e:
-                QMessageBox.warning(self, "Invalid Page Range", str(e))
-                self._progress_bar.setVisible(False)
-                self._lbl_status.setVisible(False)
-                return
-
         # Create and start worker with all PDF paths
         self._worker = ProcessingWorker()
+
         pdf_paths = [info.file_path for info in self._pdf_infos]
         self._worker.set_pdf_paths(pdf_paths)
-        self._worker.set_page_filter(page_filter)
-        self._worker.set_high_accuracy_mode(self._chk_high_accuracy.isChecked())
-        self._worker.set_auto_detect_pages(self._chk_auto_detect.isChecked())
-
-        # Persist auto-detect setting
-        self._inference_settings.auto_detect_pages = self._chk_auto_detect.isChecked()
+        self._worker.set_auto_detect_pages(True)
 
         # Connect signals
         self._worker.progress_updated.connect(self._on_progress_updated)
@@ -1096,11 +925,35 @@ class MainWindow(QMainWindow):
             self._worker.request_cancel()
             self._statusbar.showMessage("Cancelling...")
 
+    def _ask_example_only(self) -> bool:
+        """Ask user whether to export only example compounds.
+
+        Returns True if user wants example-only export, False otherwise.
+        Only shows dialog if there are "other" compounds in the results.
+        """
+        other_count = sum(1 for r in self._results if r.compound_type == "other")
+        if other_count == 0:
+            return False
+
+        example_count = sum(1 for r in self._results if r.compound_type != "other")
+        reply = QMessageBox.question(
+            self,
+            "Filter Export",
+            f"Results contain {other_count} non-example structures "
+            f"(intermediates, Markush, etc.).\n\n"
+            f"Export only {example_count} example compounds?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        return reply == QMessageBox.Yes
+
     @Slot()
     def _on_export_csv(self) -> None:
         """Handle Export CSV button click."""
         if not self._results:
             return
+
+        example_only = self._ask_example_only()
 
         # Generate default name based on first file or generic
         default_name = "extraction_results.csv"
@@ -1121,6 +974,7 @@ class MainWindow(QMainWindow):
             custom_data = self._collect_custom_column_data()
             ExportHandler.export_to_csv(
                 self._results, file_path,
+                example_only=example_only,
                 custom_columns=self._custom_columns, custom_data=custom_data
             )
             self._statusbar.showMessage(f"Exported to: {file_path}")
@@ -1133,6 +987,8 @@ class MainWindow(QMainWindow):
         """Handle Export TXT button click."""
         if not self._results:
             return
+
+        example_only = self._ask_example_only()
 
         # Generate default name based on first file or generic
         default_name = "extraction_results.txt"
@@ -1153,6 +1009,7 @@ class MainWindow(QMainWindow):
             custom_data = self._collect_custom_column_data()
             ExportHandler.export_to_txt(
                 self._results, file_path,
+                example_only=example_only,
                 custom_columns=self._custom_columns, custom_data=custom_data
             )
             self._statusbar.showMessage(f"Exported to: {file_path}")
@@ -1192,8 +1049,12 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
+        example_only = self._ask_example_only()
+
         try:
-            molecules_written = ExportHandler.export_to_sdf(self._results, file_path)
+            molecules_written = ExportHandler.export_to_sdf(
+                self._results, file_path, example_only=example_only
+            )
             self._statusbar.showMessage(f"Exported {molecules_written} molecules to: {file_path}")
             QMessageBox.information(
                 self,
@@ -2196,10 +2057,6 @@ class MainWindow(QMainWindow):
                     clipboard = QApplication.clipboard()
                     clipboard.setText(smiles)
                     self._statusbar.showMessage(f"Copied SMILES to clipboard: {smiles[:50]}...")
-
-    def _get_auto_detect_setting(self) -> bool:
-        """Get the persisted auto-detect pages setting."""
-        return InferenceSettings.get_instance().auto_detect_pages
 
     def _get_inference_mode_text(self) -> str:
         """Get display text for current inference mode."""

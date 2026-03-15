@@ -17,6 +17,11 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# Per-prediction timeout in seconds (MolSight typically takes 2-10s per image)
+PREDICT_TIMEOUT = 120
+# Startup timeout in seconds (model loading can take 30-60s)
+STARTUP_TIMEOUT = 180
+
 
 class SubprocessPredictor:
     """Base class for predictors that run in a separate venv subprocess.
@@ -52,6 +57,37 @@ class SubprocessPredictor:
         self._script_path = path
         return path
 
+    def _readline_with_timeout(self, timeout: float) -> Optional[str]:
+        """Read one line from subprocess stdout with a timeout.
+
+        Returns the line (stripped) or None if the read timed out.
+        On timeout, the subprocess is killed and self._process set to None.
+        """
+        result_holder: list[Optional[str]] = [None]
+
+        def _read():
+            try:
+                result_holder[0] = self._process.stdout.readline().strip()
+            except Exception:
+                result_holder[0] = None
+
+        reader = threading.Thread(target=_read, daemon=True)
+        reader.start()
+        reader.join(timeout=timeout)
+
+        if reader.is_alive():
+            logger.warning(
+                "Subprocess read timed out after %ds, killing worker", timeout
+            )
+            try:
+                self._process.kill()
+            except Exception:
+                pass
+            self._process = None
+            return None
+
+        return result_holder[0]
+
     def _start_process(self) -> None:
         python = self._get_python()
         script = self._write_worker_script()
@@ -66,11 +102,14 @@ class SubprocessPredictor:
             bufsize=1,
             env=env,
         )
-        # Wait for READY signal
-        line = self._process.stdout.readline().strip()
+        # Wait for READY signal with timeout
+        line = self._readline_with_timeout(STARTUP_TIMEOUT)
         if line != "READY":
+            if self._process and self._process.poll() is None:
+                self._process.kill()
+            self._process = None
             raise RuntimeError(
-                f"Worker did not send READY signal. Got: {line!r}\n"
+                f"Worker did not send READY signal within {STARTUP_TIMEOUT}s. Got: {line!r}\n"
                 "Check terminal stderr for details."
             )
         logger.info("Subprocess worker ready: %s", self.__class__.__name__)
@@ -89,8 +128,8 @@ class SubprocessPredictor:
                 self._ensure_running()
                 self._process.stdin.write(path + "\n")
                 self._process.stdin.flush()
-                result = self._process.stdout.readline().strip()
-            if result == "NONE" or not result:
+                result = self._readline_with_timeout(PREDICT_TIMEOUT)
+            if result is None or result == "NONE" or not result:
                 return None
             return result
         except (BrokenPipeError, OSError) as e:

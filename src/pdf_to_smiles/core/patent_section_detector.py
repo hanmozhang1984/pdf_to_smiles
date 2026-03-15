@@ -6,26 +6,41 @@ Abstract -> Background -> Detailed Description -> Examples -> Bio Data -> Claims
 By detecting where Examples starts and Claims begins, we can skip 30-50% of pages
 that contain Markush structures (Description) or claim text (Claims).
 
-Two-tier detection:
+Three-tier detection:
   Tier 1: pdfplumber text extraction (fast, free, works on text-based PDFs)
   Tier 2: pytesseract OCR on sampled pages (slower, works on image-based PDFs)
+  Tier 3: Claude Vision on sampled pages (most robust, works on any PDF)
 """
 
+import base64
+import io
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
 # Try to import pytesseract for OCR fallback
 try:
     import pytesseract
-    from PIL import Image
     from ..utils.paths import configure_tesseract
     HAS_TESSERACT = configure_tesseract()
 except ImportError:
     HAS_TESSERACT = False
+
+
+def _has_claude_vision() -> bool:
+    """Check if Claude Vision is available (anthropic SDK + API key)."""
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        return False
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
 @dataclass
@@ -35,7 +50,7 @@ class SectionBounds:
     examples_start: Optional[int] = None  # 1-indexed page number
     claims_start: Optional[int] = None    # 1-indexed page number
     total_pages: int = 0
-    detection_method: str = "none"        # "text", "ocr", or "none"
+    detection_method: str = "none"        # "text", "ocr", "vision", or "none"
 
     @property
     def is_valid(self) -> bool:
@@ -77,16 +92,17 @@ _EXAMPLES_PATTERNS = [
     re.compile(r'^\s*EXPERIMENTAL\s*$', re.MULTILINE),
     # Compound headers: "SPECIFIC EXAMPLES", "SYNTHESIS OF EXAMPLES", etc.
     re.compile(r'^\s*(?:SPECIFIC|SYNTHESIS\s+OF|PREPARATIVE)\s+EXAMPLES?\s*$', re.MULTILINE),
-    # "Non-Limiting Exemplary Compounds", "Exemplary Compounds", etc.
-    re.compile(
-        r'^\s*(?:NON[- ]LIMITING\s+)?EXEMPLARY\s+COMPOUNDS?\s*$',
-        re.MULTILINE | re.IGNORECASE,
-    ),
     # "Example 1:" or "Example 1." as a heading (not inline reference)
     # Must appear at/near start of line, not buried in a paragraph
     re.compile(r'^\s*Example\s+1\s*[:.]\s*', re.MULTILINE),
     # "EXAMPLE 1" in uppercase
     re.compile(r'^\s*EXAMPLE\s+1\s*[:.]*\s*', re.MULTILINE),
+    # Flexible "Example 1" with prefix: "Synthesis of Example 1",
+    # "Alternate Synthesis of Example 1", "Preparation of Example 1"
+    re.compile(
+        r'^\s*(?:(?:Alternate\s+)?Synthesis|Preparation)\s+of\s+Example\s+1\b',
+        re.MULTILINE | re.IGNORECASE,
+    ),
     # Two-column PDF fallback: pdfplumber merges columns so "EXAMPLES" may be
     # followed by text from the adjacent column (e.g., "EXAMPLES 50 yl ]-...")
     # Safe because _is_heading_context trusts all-caps matches.
@@ -118,8 +134,8 @@ def _is_examples_section_start(text: str, match: re.Match) -> bool:
         "[0096] The following examples are meant to be illustrative..."
 
     The real Examples section start is distinguished by:
-    - NO bracketed paragraph numbers ([0096]) in nearby lines
-    - Often followed by "Example 1" or specific compound synthesis text
+    - Specific compound/synthesis patterns nearby ("Example 1", compound names)
+    - NOT just a passing reference to "examples" in description text
 
     Args:
         text: Full OCR text of the page.
@@ -138,18 +154,23 @@ def _is_examples_section_start(text: str, match: re.Match) -> bool:
         return True
     if re.search(r'EXAMPLE\s+1\b', matched_text):
         return True
-    if re.search(r'EXEMPLARY\s+COMPOUNDS?', matched_text, re.IGNORECASE):
-        return True
 
     # For generic "EXAMPLES" headers, check context to filter out
     # description-section forward references
     pos = match.start()
-    # Get ~500 chars after the match for context
     context_after = text[pos:pos + 500]
 
-    # Negative signal: bracketed paragraph numbers indicate Description section
-    # e.g., [0095], [0096] — these are patent paragraph numbering
-    if re.search(r'\[\d{4,}\]', context_after):
+    # Positive signal: compound synthesis language nearby
+    if re.search(
+        r'(?:synthesis|preparation|salt|acid|mmol|mg\b|mL\b|Step\s+1)',
+        context_after, re.IGNORECASE
+    ):
+        return True
+
+    # Negative signal: "illustrate", "are meant to be" suggest a
+    # description-section forward reference, not the actual section
+    if re.search(r'(?:illustrat|are\s+meant\s+to\s+be|following\s+examples?\s+are)',
+                 context_after, re.IGNORECASE):
         return False
 
     return True
@@ -249,6 +270,15 @@ class PatentSectionDetector:
         if bounds.is_valid:
             logger.info("Section detection (text, partial): %s", bounds.summary())
             return bounds
+
+        # Tier 3: Claude Vision — most robust, works on any PDF
+        if _has_claude_vision():
+            if progress_callback:
+                progress_callback("Detecting patent sections (Claude Vision)...")
+            vision_bounds = self._detect_via_vision(pdf_path, bounds.total_pages)
+            if vision_bounds.is_valid:
+                logger.info("Section detection (vision): %s", vision_bounds.summary())
+                return vision_bounds
 
         # Fallback: no sections detected
         logger.info("No patent sections detected in %s", pdf_path)
@@ -391,10 +421,11 @@ class PatentSectionDetector:
         return bounds
 
     def _ocr_page(self, doc, page_idx: int) -> str:
-        """Render and OCR a page at low DPI for section header detection.
+        """Render and OCR a page for section header detection.
 
-        Uses 72 DPI (1:1 with PDF points) — sufficient for recognizing large
-        section header text (EXAMPLES, CLAIMS, etc.) while being fast.
+        Uses 150 DPI — sufficient for recognizing section headers in both
+        text-based and image-based/scanned PDFs. Lower DPI (72-100) produces
+        garbled text on scanned patents.
 
         Args:
             doc: pypdfium2 PdfDocument.
@@ -406,9 +437,8 @@ class PatentSectionDetector:
         try:
             page = doc[page_idx]
 
-            # 100 DPI — fast rendering while maintaining OCR accuracy
-            # for scanned/image-based pages (72 DPI too low for these)
-            scale = 100 / 72
+            # 150 DPI — reliable OCR on scanned/image-based patents
+            scale = 150 / 72
             bitmap = page.render(scale=scale, rotation=0)
             pil_image = bitmap.to_pil()
 
@@ -465,3 +495,190 @@ class PatentSectionDetector:
                     break
 
         return best_page
+
+    # ── Tier 3: Claude Vision ────────────────────────────────
+
+    _VISION_MODEL = "claude-haiku-4-5-20251001"
+
+    _VISION_PROMPT = """\
+Analyze this patent PDF page. Which section of the patent does this page belong to?
+
+Respond with JSON only:
+{
+  "section": "description" | "examples" | "claims" | "tables" | "other",
+  "confidence": 0.0-1.0,
+  "reasoning": "brief explanation"
+}
+
+Section definitions:
+- "description": Detailed description of the invention, general formulas, Markush structures with R-groups, generic reaction schemes, background, definitions. Pages with Formula (I), Formula (II), or structures with variable groups (R1, R2, X, Y).
+- "examples": Specific synthesis examples (Example 1, Example 2...), preparation of named compounds with specific substituents, step-by-step reaction procedures with actual reagents and quantities.
+- "claims": Patent claims section ("What is claimed is:", numbered claims like "1. A compound of...").
+- "tables": SAR tables, biological data tables (IC50, EC50), compound property tables with columns of numeric data.
+- "other": Title page, abstract, references, sequence listings, drawings legend."""
+
+    def _detect_via_vision(
+        self,
+        pdf_path: str,
+        total_pages: int,
+    ) -> SectionBounds:
+        """Tier 3: Use Claude Vision to classify sampled pages and find section boundaries.
+
+        Samples ~8-12 pages spread across the PDF, asks Claude what section each
+        belongs to, then infers boundary positions. Cost: ~$0.05-0.10 per patent.
+
+        Args:
+            pdf_path: Path to the PDF file.
+            total_pages: Total number of pages.
+
+        Returns:
+            SectionBounds with detected page ranges.
+        """
+        import anthropic
+        import pypdfium2 as pdfium
+
+        bounds = SectionBounds(total_pages=total_pages)
+
+        try:
+            client = anthropic.Anthropic()
+            doc = pdfium.PdfDocument(pdf_path)
+            if total_pages == 0:
+                total_pages = len(doc)
+                bounds.total_pages = total_pages
+
+            # Sample pages: spread across the PDF to find transitions
+            # More density around the typical Examples start (20-50% mark)
+            # and Claims start (80-95% mark)
+            sample_indices = set()
+            # Early pages (description)
+            sample_indices.add(max(0, int(total_pages * 0.05)))
+            sample_indices.add(int(total_pages * 0.15))
+            # Mid pages (likely near Examples start)
+            for frac in [0.25, 0.30, 0.35, 0.40, 0.50]:
+                sample_indices.add(int(total_pages * frac))
+            # Late pages (near Claims)
+            for frac in [0.70, 0.80, 0.90, 0.95]:
+                sample_indices.add(int(total_pages * frac))
+            # Clamp to valid range
+            sample_indices = sorted(
+                idx for idx in sample_indices if 0 <= idx < total_pages
+            )
+
+            # Classify each sampled page
+            page_sections = {}  # page_idx -> section string
+            for page_idx in sample_indices:
+                section = self._vision_classify_page(client, doc, page_idx)
+                if section:
+                    page_sections[page_idx] = section
+                    logger.debug(
+                        "Vision: page %d -> %s", page_idx + 1, section
+                    )
+
+            doc.close()
+
+            if not page_sections:
+                return bounds
+
+            # Find the transition points
+            # Examples start: first page classified as "examples" or "tables"
+            # (tables after examples are usually SAR data tables)
+            examples_candidates = [
+                idx for idx, s in page_sections.items()
+                if s in ("examples", "tables")
+            ]
+            claims_candidates = [
+                idx for idx, s in page_sections.items()
+                if s == "claims"
+            ]
+
+            if examples_candidates:
+                approx_start = min(examples_candidates)
+                # Binary search to refine: check pages between the last
+                # "description" page and the first "examples" page
+                desc_pages = [
+                    idx for idx, s in page_sections.items()
+                    if s == "description" and idx < approx_start
+                ]
+                search_start = max(desc_pages) + 1 if desc_pages else max(0, approx_start - 5)
+                # Refine by checking a few pages in the gap
+                best_start = approx_start
+                for page_idx in range(search_start, approx_start):
+                    section = self._vision_classify_page(client, pdfium.PdfDocument(pdf_path), page_idx)
+                    if section in ("examples", "tables"):
+                        best_start = min(best_start, page_idx)
+                        break
+                bounds.examples_start = best_start + 1  # 1-indexed
+
+            if claims_candidates:
+                approx_claims = min(claims_candidates)
+                bounds.claims_start = approx_claims + 1  # 1-indexed
+
+            if bounds.is_valid:
+                bounds.detection_method = "vision"
+
+        except Exception as e:
+            logger.debug("Vision-based section detection failed: %s", e)
+
+        return bounds
+
+    def _vision_classify_page(self, client, doc, page_idx: int) -> Optional[str]:
+        """Classify a single page using Claude Vision.
+
+        Args:
+            client: Anthropic client instance.
+            doc: pypdfium2 PdfDocument.
+            page_idx: 0-indexed page index.
+
+        Returns:
+            Section string ("description", "examples", "claims", "tables", "other")
+            or None on failure.
+        """
+        try:
+            page = doc[page_idx]
+            # 100 DPI is enough for Claude to read page content
+            bitmap = page.render(scale=100 / 72, rotation=0)
+            pil_image = bitmap.to_pil()
+
+            # Encode image
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            image_data = base64.standard_b64encode(buf.getvalue()).decode("ascii")
+
+            response = client.messages.create(
+                model=self._VISION_MODEL,
+                max_tokens=200,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_data,
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": self._VISION_PROMPT,
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            text = response.content[0].text.strip()
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1])
+
+            data = json.loads(text)
+            section = data.get("section", "other")
+            if section in ("description", "examples", "claims", "tables", "other"):
+                return section
+            return "other"
+
+        except Exception as e:
+            logger.debug("Vision classify page %d failed: %s", page_idx + 1, e)
+            return None

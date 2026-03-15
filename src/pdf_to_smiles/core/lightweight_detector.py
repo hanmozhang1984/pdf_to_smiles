@@ -33,9 +33,9 @@ class LightweightDetector:
     MIN_AREA = 5000           # Minimum contour area to filter noise
 
     # Morphological kernel size for closing gaps in structure bonds
-    MORPH_KERNEL_SIZE = 15
+    MORPH_KERNEL_SIZE = 10
     # Padding around detected regions (pixels)
-    CROP_PADDING = 10
+    CROP_PADDING = 15
 
     # Filters for individual structure candidates
     MAX_FILL_RATIO = 0.45     # Text blocks are very dense; structures are sparser
@@ -62,7 +62,7 @@ class LightweightDetector:
     @staticmethod
     def _compute_padding(w: int, h: int) -> int:
         """Compute adaptive padding based on structure dimensions."""
-        return max(8, min(40, int(0.05 * (w + h) / 2)))
+        return max(15, min(50, int(0.08 * (w + h) / 2)))
 
     def detect_structures(self, page_image: Image.Image) -> List[Image.Image]:
         """Detect and extract chemical structures from a page image.
@@ -105,12 +105,21 @@ class LightweightDetector:
                 cv2.THRESH_BINARY_INV, blockSize=25, C=10
             )
 
+            # Remove long horizontal lines (reaction arrows) before closing.
+            # These bridge separate structures and cause them to merge into
+            # one contour.  Only remove lines that are long relative to the
+            # page width (>8%) — bond lines within structures are shorter.
+            arrow_len = max(page_width // 12, 60)
+            h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (arrow_len, 1))
+            arrows = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+            binary_no_arrows = cv2.subtract(binary, arrows)
+
             # Morphological close to merge nearby strokes
             kernel = cv2.getStructuringElement(
                 cv2.MORPH_RECT,
                 (self.MORPH_KERNEL_SIZE, self.MORPH_KERNEL_SIZE)
             )
-            closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            closed = cv2.morphologyEx(binary_no_arrows, cv2.MORPH_CLOSE, kernel)
 
             # Find contours
             contours, _ = cv2.findContours(

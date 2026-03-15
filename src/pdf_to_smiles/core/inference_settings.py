@@ -17,6 +17,14 @@ class InferenceMode(Enum):
     MOLSIGHT = "molsight"             # MolSight (separate venv)
 
 
+class ClassifierMode(Enum):
+    """Available compound classifier backends."""
+    CLAUDE = "claude"     # Claude Haiku Vision (paid, requires API key)
+    OLLAMA = "ollama"     # Qwen2.5-VL via Ollama (free, local)
+    MLX = "mlx"           # MLX-VLM via OpenAI-compatible API (free, local, Apple Silicon)
+    NONE = "none"         # Skip classification entirely
+
+
 def _auto_detect_best_mode() -> InferenceMode:
     """Auto-detect the best available inference mode.
 
@@ -63,6 +71,11 @@ class InferenceSettings:
         self._cloud_timeout: int = 300  # 5 minutes for cold starts
         self._auto_detect_pages: bool = True
         self._anthropic_api_key: Optional[str] = None
+        self._classifier_mode: ClassifierMode = ClassifierMode.CLAUDE
+        self._ollama_model: str = "qwen3.5:9b"
+        self._classifier_prompt_path: Optional[str] = None
+        self._mlx_endpoint: str = "http://localhost:8000"
+        self._mlx_model: str = "mlx-community/Qwen3-VL-8B-Instruct-4bit"
         self._load_settings()
 
     @classmethod
@@ -127,6 +140,61 @@ class InferenceSettings:
         self._anthropic_api_key = value if value else None
         self._save_settings()
 
+    @property
+    def classifier_mode(self) -> ClassifierMode:
+        """Current compound classifier mode."""
+        return self._classifier_mode
+
+    @classifier_mode.setter
+    def classifier_mode(self, value: ClassifierMode) -> None:
+        """Set compound classifier mode."""
+        self._classifier_mode = value
+        self._save_settings()
+
+    @property
+    def ollama_model(self) -> str:
+        """Ollama model name for compound classification."""
+        return self._ollama_model
+
+    @ollama_model.setter
+    def ollama_model(self, value: str) -> None:
+        """Set Ollama model name."""
+        self._ollama_model = value
+        self._save_settings()
+
+    @property
+    def classifier_prompt_path(self) -> Optional[str]:
+        """Path to optimized classifier prompt file."""
+        return self._classifier_prompt_path
+
+    @classifier_prompt_path.setter
+    def classifier_prompt_path(self, value: Optional[str]) -> None:
+        """Set classifier prompt path."""
+        self._classifier_prompt_path = value if value else None
+        self._save_settings()
+
+    @property
+    def mlx_endpoint(self) -> str:
+        """MLX-VLM server endpoint URL."""
+        return self._mlx_endpoint
+
+    @mlx_endpoint.setter
+    def mlx_endpoint(self, value: str) -> None:
+        """Set MLX-VLM endpoint."""
+        self._mlx_endpoint = value
+        self._save_settings()
+
+    @property
+    def mlx_model(self) -> str:
+        """MLX-VLM model name."""
+        return self._mlx_model
+
+    @mlx_model.setter
+    def mlx_model(self, value: str) -> None:
+        """Set MLX-VLM model name."""
+        self._mlx_model = value
+        self._save_settings()
+
     def apply_api_keys(self) -> None:
         """Apply stored API keys to environment variables."""
         if self._anthropic_api_key:
@@ -170,6 +238,15 @@ class InferenceSettings:
                     self._cloud_timeout = data.get("cloud_timeout", 300)
                     self._auto_detect_pages = data.get("auto_detect_pages", True)
                     self._anthropic_api_key = data.get("anthropic_api_key")
+                    classifier_str = data.get("classifier_mode", "claude")
+                    try:
+                        self._classifier_mode = ClassifierMode(classifier_str)
+                    except ValueError:
+                        self._classifier_mode = ClassifierMode.CLAUDE
+                    self._ollama_model = data.get("ollama_model", "qwen3.5:9b")
+                    self._classifier_prompt_path = data.get("classifier_prompt_path")
+                    self._mlx_endpoint = data.get("mlx_endpoint", "http://localhost:8000")
+                    self._mlx_model = data.get("mlx_model", "mlx-community/Qwen3-VL-8B-Instruct-4bit")
         except Exception:
             pass  # Use defaults if loading fails
 
@@ -182,10 +259,16 @@ class InferenceSettings:
                     "mode": self._mode.value,
                     "cloud_endpoint": self._cloud_endpoint,
                     "cloud_timeout": self._cloud_timeout,
-                    "auto_detect_pages": self._auto_detect_pages
+                    "auto_detect_pages": self._auto_detect_pages,
+                    "classifier_mode": self._classifier_mode.value,
+                    "ollama_model": self._ollama_model,
+                    "mlx_endpoint": self._mlx_endpoint,
+                    "mlx_model": self._mlx_model,
                 }
                 if self._anthropic_api_key:
                     data["anthropic_api_key"] = self._anthropic_api_key
+                if self._classifier_prompt_path:
+                    data["classifier_prompt_path"] = self._classifier_prompt_path
                 json.dump(data, f, indent=2)
         except Exception:
             pass  # Ignore save errors

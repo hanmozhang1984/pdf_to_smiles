@@ -27,11 +27,13 @@ class SMILESPredictor:
         """
         self._predict_smiles = None
         self._initialized = False
-        if mask_text is None:
-            from pdf_to_smiles.core.text_masker import is_available as _text_masker_available
-            self._mask_text = _text_masker_available()
-        else:
-            self._mask_text = mask_text
+        # Store the explicit setting; None means "auto-detect on first use".
+        # We defer the auto-detection so that PaddlePaddle's heavy native
+        # library (libphi_core.dylib) is not imported during __init__,
+        # which would crash if __init__ runs on a QThread (protobuf
+        # C++ static-initialiser mutex deadlock → SIGABRT).
+        self._mask_text = mask_text
+        self._mask_text_resolved = mask_text is not None
 
     def _ensure_initialized(self) -> None:
         """Lazy initialization of DECIMER model."""
@@ -58,6 +60,16 @@ class SMILESPredictor:
             - Accuracy is ~96% for clean, well-rendered structures
             - Stereochemistry may not be correctly predicted
         """
+        # Lazy-resolve PaddleOCR availability on first prediction call
+        # (deferred from __init__ to avoid protobuf crash on QThread).
+        if not self._mask_text_resolved:
+            try:
+                from pdf_to_smiles.core.text_masker import is_available as _tm
+                self._mask_text = _tm()
+            except Exception:
+                self._mask_text = False
+            self._mask_text_resolved = True
+
         from pdf_to_smiles.core.image_cleaner import clean_structure_image
         structure_image = clean_structure_image(structure_image, mask_text=self._mask_text)
 

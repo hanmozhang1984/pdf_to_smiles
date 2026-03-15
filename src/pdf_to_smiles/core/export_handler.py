@@ -16,6 +16,7 @@ class ExportHandler:
         results: List[ExtractionResult],
         output_path: str,
         include_invalid: bool = True,
+        example_only: bool = False,
         source_file: Optional[str] = None,
         custom_columns: Optional[List[str]] = None,
         custom_data: Optional[dict] = None
@@ -26,6 +27,7 @@ class ExportHandler:
             results: List of ExtractionResult objects to export.
             output_path: Path for the output CSV file.
             include_invalid: Whether to include invalid/failed predictions.
+            example_only: If True, only export example compounds (exclude "other").
             source_file: Optional source PDF filename to include in output.
             custom_columns: Optional list of custom column names.
             custom_data: Optional dict of {(row, col_name): value} for custom data.
@@ -37,6 +39,8 @@ class ExportHandler:
         custom_data = custom_data or {}
 
         # Filter results if needed
+        if example_only:
+            results = [r for r in results if r.compound_type != "other"]
         if not include_invalid:
             results = [r for r in results if r.is_valid]
 
@@ -118,6 +122,7 @@ class ExportHandler:
         results: List[ExtractionResult],
         output_path: str,
         include_invalid: bool = True,
+        example_only: bool = False,
         source_file: Optional[str] = None,
         custom_columns: Optional[List[str]] = None,
         custom_data: Optional[dict] = None
@@ -128,6 +133,7 @@ class ExportHandler:
             results: List of ExtractionResult objects to export.
             output_path: Path for the output TXT file.
             include_invalid: Whether to include invalid/failed predictions.
+            example_only: If True, only export example compounds (exclude "other").
             source_file: Optional source PDF filename to include in output.
             custom_columns: Optional list of custom column names.
             custom_data: Optional dict of {(row, col_name): value} for custom data.
@@ -139,6 +145,8 @@ class ExportHandler:
         custom_data = custom_data or {}
 
         # Filter results if needed
+        if example_only:
+            results = [r for r in results if r.compound_type != "other"]
         if not include_invalid:
             results = [r for r in results if r.is_valid]
 
@@ -208,7 +216,8 @@ class ExportHandler:
     def export_smiles_only(
         results: List[ExtractionResult],
         output_path: str,
-        canonical: bool = True
+        canonical: bool = True,
+        example_only: bool = False,
     ) -> None:
         """Export only valid SMILES strings, one per line.
 
@@ -216,10 +225,14 @@ class ExportHandler:
             results: List of ExtractionResult objects to export.
             output_path: Path for the output file.
             canonical: If True, export canonical SMILES; otherwise raw predictions.
+            example_only: If True, only export example compounds (exclude "other").
 
         Raises:
             IOError: If file cannot be written.
         """
+        if example_only:
+            results = [r for r in results if r.compound_type != "other"]
+
         # Ensure parent directory exists
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -234,7 +247,8 @@ class ExportHandler:
     def export_to_sdf(
         results: List[ExtractionResult],
         output_path: str,
-        source_file: Optional[str] = None
+        source_file: Optional[str] = None,
+        example_only: bool = False,
     ) -> int:
         """Export valid results to an SDF (Structure Data File) format.
 
@@ -242,6 +256,7 @@ class ExportHandler:
             results: List of ExtractionResult objects to export.
             output_path: Path for the output SDF file.
             source_file: Optional source PDF filename to include as property.
+            example_only: If True, only export example compounds (exclude "other").
 
         Returns:
             Number of molecules successfully written.
@@ -255,6 +270,9 @@ class ExportHandler:
             from rdkit.Chem import AllChem
         except ImportError:
             raise ImportError("RDKit is required for SDF export")
+
+        if example_only:
+            results = [r for r in results if r.compound_type != "other"]
 
         # Ensure parent directory exists
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)

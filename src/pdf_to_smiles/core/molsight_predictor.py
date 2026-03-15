@@ -1,7 +1,7 @@
 """MolSight SMILES predictor running in an isolated venv subprocess.
 
 MolSight (hustvl/MolSight) uses an EfficientViT encoder + transformer decoder
-for chemical structure recognition. It runs in /tmp/MolSight/venv to avoid
+for chemical structure recognition. It runs in ~/Documents/Projects/MolSight/venv to avoid
 dependency conflicts with the main app.
 
 Improvements over raw MolSight:
@@ -14,6 +14,7 @@ Improvements over raw MolSight:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import textwrap
 from typing import List, Optional
@@ -91,16 +92,20 @@ def _is_valid_smiles(smiles: str) -> bool:
         return False
 
 
-class MolSightPredictor(SubprocessPredictor):
-    VENV_PATH = "/tmp/MolSight/venv"
+MOLSIGHT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "Projects", "MolSight")
 
-    WORKER_SCRIPT = textwrap.dedent("""\
+
+class MolSightPredictor(SubprocessPredictor):
+    VENV_PATH = os.path.join(MOLSIGHT_DIR, "venv")
+
+    # Template uses {checkpoint_path} and {molsight_dir} placeholders, filled in __init__
+    _WORKER_SCRIPT_TEMPLATE = textwrap.dedent("""\
         import sys
         import os
 
         # Run from MolSight directory so relative paths (vocab/, checkpoints) work
-        os.chdir("/tmp/MolSight")
-        sys.path.insert(0, "/tmp/MolSight")
+        os.chdir("{molsight_dir}")
+        sys.path.insert(0, "{molsight_dir}")
 
         import cv2
         import torch
@@ -127,7 +132,7 @@ class MolSightPredictor(SubprocessPredictor):
             use_qknorm=True,
             use_swiglu=True,
             use_rmsnorm=True,
-            lora=False,
+            lora={use_lora},
             regression=False,
             input_size=512,
             formats=["char", "edges"],
@@ -148,7 +153,7 @@ class MolSightPredictor(SubprocessPredictor):
         model.to(device)
 
         # Load checkpoint
-        ckpt_path = "pubchem_uspto_smiles_edges_30.pth"
+        ckpt_path = "{checkpoint_path}"
         if not os.path.exists(ckpt_path):
             import urllib.request
             url = "https://huggingface.co/Robert-zwr/MolSight/resolve/main/pubchem_uspto_smiles_edges_30.pth?download=true"
@@ -157,8 +162,12 @@ class MolSightPredictor(SubprocessPredictor):
 
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         state = checkpoint["model"]
-        state = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
+        state = {{(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}}
         model.load_state_dict(state, strict=False)
+
+        if {use_lora}:
+            from molsight.model import enable_lora
+            enable_lora(model)
 
         if hasattr(model, "module"):
             model = model.module
@@ -219,10 +228,25 @@ class MolSightPredictor(SubprocessPredictor):
                     print("NONE", flush=True)
             except Exception as e:
                 print(f"NONE", flush=True)
-                print(f"Error: {e}", file=sys.stderr, flush=True)
+                print(f"Error: {{e}}", file=sys.stderr, flush=True)
     """)
 
-    def __init__(self):
+    # Default WORKER_SCRIPT for backward compatibility (used by SubprocessPredictor)
+    WORKER_SCRIPT = _WORKER_SCRIPT_TEMPLATE.format(
+        molsight_dir=MOLSIGHT_DIR,
+        checkpoint_path="pubchem_uspto_smiles_edges_30.pth",
+        use_lora="False",
+    )
+
+    def __init__(self, checkpoint_path: str = "pubchem_uspto_smiles_edges_30.pth"):
+        # Determine if this is a LoRA checkpoint (GRPO-trained)
+        use_lora = "grpo" in checkpoint_path.lower() or "lora" in checkpoint_path.lower()
+        # Set WORKER_SCRIPT before super().__init__() which starts the subprocess
+        self.WORKER_SCRIPT = self._WORKER_SCRIPT_TEMPLATE.format(
+            molsight_dir=MOLSIGHT_DIR,
+            checkpoint_path=checkpoint_path,
+            use_lora=str(use_lora),
+        )
         super().__init__()
         self._molscribe_fallback = None
         # Check if text masking is available

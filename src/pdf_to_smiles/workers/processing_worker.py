@@ -282,6 +282,7 @@ class ProcessingWorker(QThread):
                         logger.debug("Patent section detection failed: %s", e)
 
                 # Step 2: Auto-detect structure pages (visual scan)
+                docling_detector = None  # Will be set if Docling classifier is used
                 if self._auto_detect_pages and not self._page_filter:
                     self._emit_progress(
                         0, total_pages, 0, 0,
@@ -290,6 +291,21 @@ class ProcessingWorker(QThread):
                     try:
                         from ..core.page_classifier import get_classifier
                         classifier = get_classifier()
+
+                        # If we got a DoclingClassifier, create a DoclingDetector
+                        # to reuse cached layout bounding boxes for structure detection
+                        try:
+                            from ..core.docling_classifier import DoclingClassifier
+                            from ..core.docling_detector import DoclingDetector
+                            if isinstance(classifier, DoclingClassifier):
+                                docling_detector = DoclingDetector(classifier)
+                            # Also check HybridClassifier which wraps DoclingClassifier
+                            elif hasattr(classifier, '_primary') and isinstance(
+                                classifier._primary, DoclingClassifier
+                            ):
+                                docling_detector = DoclingDetector(classifier._primary)
+                        except ImportError:
+                            pass
 
                         def scan_progress(current, total):
                             if self._is_cancelled():
@@ -332,6 +348,7 @@ class ProcessingWorker(QThread):
 
                 # Track compound ID for sequential assignment across pages
                 next_compound_id = 1
+                last_example_heading_id = None  # carry-forward for continuation pages
 
                 # Show which pages will be processed
                 if effective_page_filter:
@@ -346,156 +363,216 @@ class ProcessingWorker(QThread):
                         f"File {file_num}/{total_files}: Processing all {total_pages} pages..."
                     )
 
-                # Process each page
-                for page_num in range(1, total_pages + 1):
-                    if self._is_cancelled():
-                        self._emit_progress(page_num, total_pages, 0, 0, "Cancelled")
-                        break
-
-                    # Skip pages not in filter
-                    if effective_page_filter and page_num not in effective_page_filter:
+                # Build list of pages to process
+                pages_to_process = []
+                for pn in range(1, total_pages + 1):
+                    if effective_page_filter and pn not in effective_page_filter:
                         continue
+                    pages_to_process.append(pn)
 
-                    overall_current_page += 1
-                    # Build status message with ETA if available
-                    status_msg = f"File {file_num}/{total_files} ({file_name}): Page {page_num}/{total_pages}"
-                    if self._pages_processed > 0:
-                        elapsed = time.time() - self._processing_start
-                        avg_per_page = elapsed / self._pages_processed
-                        remaining_pages = total_pages - page_num
-                        remaining_seconds = avg_per_page * remaining_pages
-                        status_msg += f" \u2014 {self._format_eta(remaining_seconds)}"
-                    self._emit_progress(
-                        page_num, total_pages, 0, 0, status_msg
-                    )
+                # Determine batch size for parallel classification
+                _CLASSIFY_BATCH_SIZE = 4
 
-                    # Render page as image
-                    page_image = self._pdf_processor.get_page_image(page_num)
-
+                # Process pages in batches for parallel classification
+                batch_start = 0
+                while batch_start < len(pages_to_process):
                     if self._is_cancelled():
                         break
 
-                    # Detect chemical structures (uses cloud or local based on settings)
-                    mode_label = "cloud" if self._inference_settings.is_cloud else "local"
-                    self._emit_progress(
-                        page_num, total_pages, 0, 0,
-                        f"File {file_num}/{total_files}: Detecting structures on page {page_num} ({mode_label})..."
-                    )
-                    structures_with_boxes = self._inference_provider.detect_structures_with_boxes(page_image)
+                    batch_end = min(batch_start + _CLASSIFY_BATCH_SIZE, len(pages_to_process))
+                    batch_page_nums = pages_to_process[batch_start:batch_end]
 
-                    if not structures_with_boxes:
-                        self._pages_processed += 1
-                        continue
-
-                    structures = [img for img, _ in structures_with_boxes]
-                    structure_boxes = [box for _, box in structures_with_boxes]
-                    total_structures = len(structures)
-
-                    # Classify structures using Claude Haiku (if API key available)
-                    # Returns list of {"type": str, "id": Optional[str]} or None
-                    classification_results = self._classify_structures(
-                        page_image, structure_boxes,
-                        page_num=page_num,
-                        section_bounds=section_bounds,
-                        structure_images=structures,
-                    )
-
-                    # Detect example numbers from page using OCR
-                    # Falls back to sequential numbering if OCR is unavailable
-                    compound_results = self._detect_example_numbers_from_page(
-                        page_image, structures, next_compound_id,
-                        structure_boxes=structure_boxes,
-                    )
-
-                    # Update next_compound_id: collect all numeric IDs from both LLM and OCR
-                    detected_ids = []
-                    for cid, _ in compound_results:
-                        try:
-                            detected_ids.append(int(re.sub(r'[a-zA-Z]', '', cid)))
-                        except ValueError:
-                            pass
-                    if classification_results:
-                        for cr in classification_results:
-                            llm_id = cr.get("id")
-                            if llm_id:
-                                try:
-                                    detected_ids.append(int(re.sub(r'[a-zA-Z]', '', llm_id)))
-                                except ValueError:
-                                    pass
-                    if detected_ids:
-                        next_compound_id = max(max(detected_ids) + 1, next_compound_id + total_structures)
-                    else:
-                        next_compound_id += total_structures
-
-                    # Process each detected structure
-                    for struct_idx, struct_image in enumerate(structures):
+                    # --- Phase 1: Detect structures for each page in the batch ---
+                    batch_data = []  # list of dicts with page info
+                    for page_num in batch_page_nums:
                         if self._is_cancelled():
                             break
 
+                        overall_current_page += 1
+                        status_msg = f"File {file_num}/{total_files} ({file_name}): Page {page_num}/{total_pages}"
+                        if self._pages_processed > 0:
+                            elapsed = time.time() - self._processing_start
+                            avg_per_page = elapsed / self._pages_processed
+                            remaining_pages = len(pages_to_process) - (batch_start + len(batch_data))
+                            remaining_seconds = avg_per_page * remaining_pages
+                            status_msg += f" \u2014 {self._format_eta(remaining_seconds)}"
                         self._emit_progress(
-                            page_num, total_pages, struct_idx + 1, total_structures,
-                            f"File {file_num}/{total_files}: Page {page_num}, structure {struct_idx + 1}/{total_structures}"
+                            page_num, total_pages, 0, 0, status_msg
                         )
 
-                        # Create result object with source file
-                        result = ExtractionResult(
-                            page_number=page_num,
-                            structure_index=struct_idx,
-                            source_file=file_name,
-                            original_image=struct_image
+                        page_image = self._pdf_processor.get_page_image(page_num)
+                        if self._is_cancelled():
+                            break
+
+                        mode_label = "cloud" if self._inference_settings.is_cloud else "local"
+                        self._emit_progress(
+                            page_num, total_pages, 0, 0,
+                            f"File {file_num}/{total_files}: Detecting structures on page {page_num} ({mode_label})..."
                         )
 
-                        # Get compound ID and bounding box from OCR results
-                        if struct_idx < len(compound_results):
-                            compound_id, bbox = compound_results[struct_idx]
-                            result.compound_id = compound_id
-                            result.bounding_box = bbox
-
-                        # Set compound type and override ID from LLM classifier
-                        if classification_results and struct_idx < len(classification_results):
-                            cr = classification_results[struct_idx]
-                            result.compound_type = cr["type"]
-                            # LLM compound ID takes priority over OCR
-                            llm_id = cr.get("id")
-                            if llm_id:
-                                result.compound_id = llm_id
-
-                        try:
-                            # Predict SMILES (uses cloud or local based on settings)
-                            smiles = self._inference_provider.predict_smiles(
-                                struct_image, high_accuracy=self._high_accuracy_mode
+                        # Try DoclingDetector first (uses cached ML layout boxes),
+                        # fall back to LightweightDetector if unavailable or no results
+                        structures_with_boxes = []
+                        if docling_detector is not None:
+                            structures_with_boxes = docling_detector.detect_structures_with_boxes(
+                                page_image, page_num
                             )
-                            result.smiles = smiles
+                        if not structures_with_boxes:
+                            structures_with_boxes = self._inference_provider.detect_structures_with_boxes(page_image)
 
-                            if smiles:
-                                # Validate and render
-                                is_valid, canonical, rdkit_img = \
-                                    self._smiles_validator.validate_and_render(smiles)
-                                result.is_valid = is_valid
-                                result.canonical_smiles = canonical
-                                result.rdkit_image = rdkit_img
+                        if not structures_with_boxes:
+                            self._pages_processed += 1
+                            continue
 
-                                # Calculate physicochemical properties for valid SMILES
-                                if is_valid:
-                                    props = self._smiles_validator.get_all_properties(
-                                        canonical or smiles
-                                    )
-                                    result.molecular_weight = props['molecular_weight']
-                                    result.molecular_formula = props['molecular_formula']
-                                    result.clogp = props['clogp']
-                                    result.tpsa = props['tpsa']
-                                    result.num_rotatable_bonds = props['num_rotatable_bonds']
-                                    result.num_stereocenters = props['num_stereocenters']
-                            else:
-                                result.error_message = "SMILES prediction failed"
+                        structures = [img for img, _ in structures_with_boxes]
+                        structure_boxes = [box for _, box in structures_with_boxes]
 
-                        except Exception as e:
-                            result.error_message = str(e)
+                        batch_data.append({
+                            "page_num": page_num,
+                            "page_image": page_image,
+                            "structures": structures,
+                            "structure_boxes": structure_boxes,
+                        })
 
-                        results.append(result)
-                        self.result_ready.emit(result)
+                    if self._is_cancelled() or not batch_data:
+                        batch_start = batch_end
+                        continue
 
-                    self._pages_processed += 1
+                    # --- Phase 2: Classify all pages in batch in parallel ---
+                    batch_classification = self._classify_structures_batch(
+                        batch_data,
+                        section_bounds=section_bounds,
+                    )
+
+                    # --- Phase 3: Process results serially (heading, OCR, SMILES) ---
+                    for data_idx, page_data in enumerate(batch_data):
+                        if self._is_cancelled():
+                            break
+
+                        page_num = page_data["page_num"]
+                        page_image = page_data["page_image"]
+                        structures = page_data["structures"]
+                        structure_boxes = page_data["structure_boxes"]
+                        total_structures = len(structures)
+                        classification_results = batch_classification[data_idx] if batch_classification else None
+
+                        # Extract authoritative Example heading from page text
+                        heading = self._extract_example_heading(
+                            page_num, page_image=page_image
+                        )
+                        if heading:
+                            last_example_heading_id = heading
+                        example_heading_id = last_example_heading_id
+
+                        # Detect example numbers from page using OCR
+                        compound_results = self._detect_example_numbers_from_page(
+                            page_image, structures, next_compound_id,
+                            structure_boxes=structure_boxes,
+                        )
+
+                        # Update next_compound_id
+                        detected_ids = []
+                        if example_heading_id:
+                            try:
+                                detected_ids.append(
+                                    int(re.sub(r'[a-zA-Z]', '', example_heading_id))
+                                )
+                            except ValueError:
+                                pass
+                        for cid, _ in compound_results:
+                            try:
+                                detected_ids.append(int(re.sub(r'[a-zA-Z]', '', cid)))
+                            except ValueError:
+                                pass
+                        if classification_results:
+                            for cr in classification_results:
+                                llm_id = cr.get("id")
+                                if llm_id:
+                                    try:
+                                        detected_ids.append(int(re.sub(r'[a-zA-Z]', '', llm_id)))
+                                    except ValueError:
+                                        pass
+                        if detected_ids:
+                            next_compound_id = max(max(detected_ids) + 1, next_compound_id + total_structures)
+                        else:
+                            next_compound_id += total_structures
+
+                        # Process each detected structure
+                        for struct_idx, struct_image in enumerate(structures):
+                            if self._is_cancelled():
+                                break
+
+                            result = ExtractionResult(
+                                page_number=page_num,
+                                structure_index=struct_idx,
+                                source_file=file_name,
+                                original_image=struct_image
+                            )
+
+                            if struct_idx < len(compound_results):
+                                compound_id, bbox = compound_results[struct_idx]
+                                result.compound_id = compound_id
+                                result.bounding_box = bbox
+
+                            if classification_results and struct_idx < len(classification_results):
+                                cr = classification_results[struct_idx]
+                                result.compound_type = cr["type"]
+                                llm_id = cr.get("id")
+                                if llm_id:
+                                    result.compound_id = llm_id
+
+                            if (example_heading_id
+                                    and result.compound_type == "example_compound"):
+                                result.compound_id = example_heading_id
+
+                            if classification_results and result.compound_type == "other":
+                                results.append(result)
+                                self.result_ready.emit(result)
+                                continue
+
+                            self._emit_progress(
+                                page_num, total_pages, struct_idx + 1, total_structures,
+                                f"File {file_num}/{total_files}: Page {page_num}, structure {struct_idx + 1}/{total_structures}"
+                            )
+
+                            try:
+                                # Predict SMILES (uses cloud or local based on settings)
+                                smiles = self._inference_provider.predict_smiles(
+                                    struct_image, high_accuracy=self._high_accuracy_mode
+                                )
+                                result.smiles = smiles
+
+                                if smiles:
+                                    # Validate and render
+                                    is_valid, canonical, rdkit_img = \
+                                        self._smiles_validator.validate_and_render(smiles)
+                                    result.is_valid = is_valid
+                                    result.canonical_smiles = canonical
+                                    result.rdkit_image = rdkit_img
+
+                                    # Calculate physicochemical properties for valid SMILES
+                                    if is_valid:
+                                        props = self._smiles_validator.get_all_properties(
+                                            canonical or smiles
+                                        )
+                                        result.molecular_weight = props['molecular_weight']
+                                        result.molecular_formula = props['molecular_formula']
+                                        result.clogp = props['clogp']
+                                        result.tpsa = props['tpsa']
+                                        result.num_rotatable_bonds = props['num_rotatable_bonds']
+                                        result.num_stereocenters = props['num_stereocenters']
+                                else:
+                                    result.error_message = "SMILES prediction failed"
+
+                            except Exception as e:
+                                result.error_message = str(e)
+
+                            results.append(result)
+                            self.result_ready.emit(result)
+
+                        self._pages_processed += 1
+
+                    batch_start = batch_end
 
                 # Extract biological data from the entire PDF
                 if not self._is_cancelled():
@@ -731,6 +808,95 @@ class ProcessingWorker(QThread):
         except Exception:
             return [(str(fallback_start_id + i), None) for i in range(total_structures)]
 
+    _HEADING_RE = re.compile(
+        r'(?:Example|Ex\.?|Compound|Cpd\.?|Cmpd\.?)\s+'
+        r'(\d{1,4}(?:[.-]\d{1,4})?[a-zA-Z]?)',
+        re.IGNORECASE,
+    )
+
+    def _extract_example_heading(
+        self, page_num: int, page_image=None,
+    ) -> Optional[str]:
+        """Extract the Example/Compound number from section headings on a page.
+
+        Looks for patterns like "Example 25", "Ex. 7", "Compound 100-7" in the
+        top portion of the page.  Tries pdfplumber text first (fast, for
+        text-based PDFs), then falls back to Tesseract OCR on the page image
+        (for scanned / image-only PDFs).
+
+        Returns the number/ID portion (e.g. "25", "7", "100-7") or None.
+        """
+        # --- Strategy 1: pdfplumber (text-based PDFs) ---
+        result = self._extract_heading_from_text(page_num)
+        if result:
+            return result
+
+        # --- Strategy 2: Tesseract OCR on page image (image-only PDFs) ---
+        if page_image is not None and HAS_TESSERACT:
+            result = self._extract_heading_from_ocr(page_image)
+            if result:
+                return result
+
+        return None
+
+    def _extract_heading_from_text(self, page_num: int) -> Optional[str]:
+        """Try to extract Example heading via pdfplumber text blocks."""
+        if self._pdf_processor is None:
+            return None
+
+        try:
+            blocks = self._pdf_processor.get_page_text_blocks(page_num)
+        except Exception:
+            return None
+
+        if not blocks:
+            return None
+
+        try:
+            _, page_height = self._pdf_processor.get_page_dimensions(page_num)
+        except Exception:
+            page_height = 800
+
+        top_threshold = page_height * 0.30
+
+        # Reconstruct lines from word-level blocks.
+        lines: dict[int, list] = {}
+        for b in blocks:
+            y_mid = (b['bbox'][1] + b['bbox'][3]) / 2
+            if y_mid > top_threshold:
+                continue
+            bucket = round(y_mid / 4) * 4
+            lines.setdefault(bucket, []).append(b)
+
+        for bucket in sorted(lines.keys()):
+            words_in_line = sorted(lines[bucket], key=lambda w: w['bbox'][0])
+            line_text = ' '.join(w['text'] for w in words_in_line)
+            m = self._HEADING_RE.search(line_text)
+            if m:
+                return m.group(1)
+
+        return None
+
+    def _extract_heading_from_ocr(self, page_image) -> Optional[str]:
+        """Try to extract Example heading via Tesseract OCR on the top strip."""
+        try:
+            width, height = page_image.size
+            # Crop to top 20% — headings are near the top
+            top_strip = page_image.crop((0, 0, width, int(height * 0.20)))
+
+            ocr_text = pytesseract.image_to_string(top_strip)
+            if not ocr_text:
+                return None
+
+            for line in ocr_text.splitlines():
+                m = self._HEADING_RE.search(line)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+
+        return None
+
     @staticmethod
     def _locate_structures_on_page(
         page_image,
@@ -799,7 +965,13 @@ class ProcessingWorker(QThread):
         section_bounds=None,
         structure_images: Optional[list] = None,
     ) -> Optional[list]:
-        """Classify structures as example_compound or other using Claude Haiku.
+        """Classify structures as example_compound or other.
+
+        Routes to the appropriate classifier backend based on
+        InferenceSettings.classifier_mode:
+          - CLAUDE: Claude Haiku Vision (original, paid)
+          - OLLAMA: Qwen2.5-VL via Ollama (free, local)
+          - NONE: skip classification
 
         Args:
             page_image: Full page image (PIL Image).
@@ -810,23 +982,24 @@ class ProcessingWorker(QThread):
             structure_images: List of cropped structure images (used to locate
                 structures on the page when bounding boxes are not available).
 
-        Returns None if the classifier is not available (no API key).
+        Returns None if the classifier is not available.
         """
         if not structure_boxes:
             return None
 
-        try:
-            from ..core.llm_compound_classifier import is_available, LLMCompoundClassifier
-            if not is_available():
-                return None
+        from ..core.inference_settings import InferenceSettings, ClassifierMode
+        classifier_mode = InferenceSettings.get_instance().classifier_mode
 
+        if classifier_mode == ClassifierMode.NONE:
+            return None
+
+        try:
             # If any boxes are None, try to locate structures via template matching
             if any(box is None for box in structure_boxes):
                 if structure_images and len(structure_images) == len(structure_boxes):
                     computed_boxes = self._locate_structures_on_page(
                         page_image, structure_images
                     )
-                    # Merge: use original box if available, computed box otherwise
                     structure_boxes = [
                         orig if orig is not None else computed
                         for orig, computed in zip(structure_boxes, computed_boxes)
@@ -835,18 +1008,216 @@ class ProcessingWorker(QThread):
                     logger.debug("Cannot classify: no bounding boxes and no structure images")
                     return None
 
-            # Reuse classifier instance across pages (shares Anthropic client)
-            if not hasattr(self, '_compound_classifier'):
-                self._compound_classifier = LLMCompoundClassifier()
-
-            return self._compound_classifier.classify_page_structures(
-                page_image, structure_boxes,
-                page_num=page_num,
-                section_bounds=section_bounds,
-            )
+            if classifier_mode == ClassifierMode.MLX:
+                from ..core.mlx_compound_classifier import (
+                    is_available as mlx_available,
+                    MLXVLMCompoundClassifier,
+                )
+                settings = InferenceSettings.get_instance()
+                if not mlx_available(settings.mlx_endpoint):
+                    logger.debug("MLX-VLM classifier not available")
+                    return None
+                if not hasattr(self, '_mlx_classifier'):
+                    self._mlx_classifier = MLXVLMCompoundClassifier(
+                        base_url=settings.mlx_endpoint,
+                        model=settings.mlx_model,
+                        prompt_path=settings.classifier_prompt_path,
+                    )
+                return self._mlx_classifier.classify_page_structures(
+                    page_image, structure_boxes,
+                    page_num=page_num,
+                    section_bounds=section_bounds,
+                )
+            elif classifier_mode == ClassifierMode.OLLAMA:
+                from ..core.ollama_compound_classifier import (
+                    is_available as ollama_available,
+                    OllamaCompoundClassifier,
+                )
+                settings = InferenceSettings.get_instance()
+                if not ollama_available(settings.ollama_model):
+                    logger.debug("Ollama classifier not available")
+                    return None
+                if not hasattr(self, '_ollama_classifier'):
+                    self._ollama_classifier = OllamaCompoundClassifier(
+                        model=settings.ollama_model,
+                        prompt_path=settings.classifier_prompt_path,
+                    )
+                return self._ollama_classifier.classify_page_structures(
+                    page_image, structure_boxes,
+                    page_num=page_num,
+                    section_bounds=section_bounds,
+                )
+            else:
+                # Default: Claude Haiku Vision
+                from ..core.llm_compound_classifier import (
+                    is_available,
+                    LLMCompoundClassifier,
+                )
+                if not is_available():
+                    return None
+                if not hasattr(self, '_compound_classifier'):
+                    self._compound_classifier = LLMCompoundClassifier()
+                return self._compound_classifier.classify_page_structures(
+                    page_image, structure_boxes,
+                    page_num=page_num,
+                    section_bounds=section_bounds,
+                )
         except Exception as e:
             logger.debug("Compound classification failed: %s", e)
             return None
+
+    def _classify_structures_batch(
+        self,
+        batch_data: list,
+        section_bounds=None,
+    ) -> Optional[list]:
+        """Classify structures for multiple pages, using parallel requests for Ollama.
+
+        For Ollama mode, sends all pages to the batch classifier concurrently.
+        For Claude mode, falls back to serial classification per page.
+
+        Args:
+            batch_data: List of dicts with keys: page_num, page_image,
+                structures, structure_boxes.
+            section_bounds: SectionBounds from PatentSectionDetector.
+
+        Returns:
+            List of classification results (one per page in batch_data),
+            or None if classifier is not available.
+        """
+        from ..core.inference_settings import InferenceSettings, ClassifierMode
+        classifier_mode = InferenceSettings.get_instance().classifier_mode
+
+        if classifier_mode == ClassifierMode.NONE:
+            return None
+
+        if classifier_mode == ClassifierMode.MLX:
+            from ..core.mlx_compound_classifier import (
+                is_available as mlx_available,
+                MLXVLMCompoundClassifier,
+            )
+            settings = InferenceSettings.get_instance()
+            if not mlx_available(settings.mlx_endpoint):
+                return None
+            if not hasattr(self, '_mlx_classifier'):
+                self._mlx_classifier = MLXVLMCompoundClassifier(
+                    base_url=settings.mlx_endpoint,
+                    model=settings.mlx_model,
+                    prompt_path=settings.classifier_prompt_path,
+                )
+
+            # Prepare batch items, resolving None boxes via template matching
+            batch_items = []
+            for page_data in batch_data:
+                boxes = page_data["structure_boxes"]
+                if any(box is None for box in boxes):
+                    structs = page_data["structures"]
+                    if structs and len(structs) == len(boxes):
+                        computed = self._locate_structures_on_page(
+                            page_data["page_image"], structs
+                        )
+                        boxes = [
+                            orig if orig is not None else comp
+                            for orig, comp in zip(boxes, computed)
+                        ]
+                    else:
+                        batch_items.append(None)
+                        continue
+
+                batch_items.append({
+                    "page_image": page_data["page_image"],
+                    "structure_boxes": boxes,
+                    "page_num": page_data["page_num"],
+                    "section_bounds": section_bounds,
+                })
+
+            valid_indices = [i for i, item in enumerate(batch_items) if item is not None]
+            valid_items = [batch_items[i] for i in valid_indices]
+
+            if not valid_items:
+                return None
+
+            try:
+                batch_results = self._mlx_classifier.classify_batch(valid_items)
+            except Exception as e:
+                logger.debug("MLX batch classification failed: %s", e)
+                return None
+
+            all_results = [None] * len(batch_data)
+            for vi, ri in zip(valid_indices, batch_results):
+                all_results[vi] = ri
+            return all_results
+
+        if classifier_mode == ClassifierMode.OLLAMA:
+            from ..core.ollama_compound_classifier import (
+                is_available as ollama_available,
+                OllamaCompoundClassifier,
+            )
+            settings = InferenceSettings.get_instance()
+            if not ollama_available(settings.ollama_model):
+                return None
+            if not hasattr(self, '_ollama_classifier'):
+                self._ollama_classifier = OllamaCompoundClassifier(
+                    model=settings.ollama_model,
+                    prompt_path=settings.classifier_prompt_path,
+                )
+
+            # Prepare batch items, resolving None boxes via template matching
+            batch_items = []
+            for page_data in batch_data:
+                boxes = page_data["structure_boxes"]
+                if any(box is None for box in boxes):
+                    structs = page_data["structures"]
+                    if structs and len(structs) == len(boxes):
+                        computed = self._locate_structures_on_page(
+                            page_data["page_image"], structs
+                        )
+                        boxes = [
+                            orig if orig is not None else comp
+                            for orig, comp in zip(boxes, computed)
+                        ]
+                    else:
+                        batch_items.append(None)
+                        continue
+
+                batch_items.append({
+                    "page_image": page_data["page_image"],
+                    "structure_boxes": boxes,
+                    "page_num": page_data["page_num"],
+                    "section_bounds": section_bounds,
+                })
+
+            # Separate valid items for batch classification
+            valid_indices = [i for i, item in enumerate(batch_items) if item is not None]
+            valid_items = [batch_items[i] for i in valid_indices]
+
+            if not valid_items:
+                return None
+
+            try:
+                batch_results = self._ollama_classifier.classify_batch(valid_items)
+            except Exception as e:
+                logger.debug("Batch classification failed: %s", e)
+                return None
+
+            # Map results back to original indices
+            all_results = [None] * len(batch_data)
+            for vi, ri in zip(valid_indices, batch_results):
+                all_results[vi] = ri
+            return all_results
+
+        # For Claude / other modes, fall back to serial classification
+        serial_results = []
+        for page_data in batch_data:
+            r = self._classify_structures(
+                page_data["page_image"],
+                page_data["structure_boxes"],
+                page_num=page_data["page_num"],
+                section_bounds=section_bounds,
+                structure_images=page_data["structures"],
+            )
+            serial_results.append(r)
+        return serial_results
 
     @staticmethod
     def _format_eta(seconds: float) -> str:

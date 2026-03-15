@@ -10,7 +10,7 @@ classify_page() is provided for interface compatibility but is less efficient (w
 import logging
 import tempfile
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
 
@@ -37,6 +37,11 @@ class DoclingClassifier:
 
     def __init__(self):
         self._converter = None
+        # Cache layout clusters (with bounding boxes) from classify_pdf()
+        # Maps page_no → list of (label, confidence, bbox) tuples
+        self._cached_layout: Dict[int, List[Tuple[str, float, object]]] = {}
+        # Cache page dimensions in points from Docling result
+        self._cached_page_dims: Dict[int, Tuple[float, float]] = {}
 
     def _load_model(self):
         """Lazy-init the Docling converter with layout-only settings."""
@@ -83,6 +88,10 @@ class DoclingClassifier:
             page_no = page.page_no  # 1-indexed
             layout = page.predictions.layout
 
+            # Cache page dimensions in points for coordinate mapping
+            if hasattr(page, 'size') and page.size is not None:
+                self._cached_page_dims[page_no] = (page.size.width, page.size.height)
+
             if layout is None:
                 classifications[page_no] = PageClassification()
                 continue
@@ -90,6 +99,8 @@ class DoclingClassifier:
             categories = {}
             confidence_scores = {}
 
+            # Cache all layout clusters with bounding boxes
+            cached_clusters = []
             for cluster in layout.clusters:
                 label = cluster.label.value
                 conf = cluster.confidence
@@ -101,6 +112,10 @@ class DoclingClassifier:
                 confidence_scores[label] = max(
                     confidence_scores.get(label, 0.0), conf
                 )
+
+                cached_clusters.append((label, conf, cluster.bbox))
+
+            self._cached_layout[page_no] = cached_clusters
 
             has_structures = any(c in categories for c in _STRUCTURE_LABELS)
             has_tables = any(c in categories for c in _TABLE_LABELS)
@@ -114,6 +129,91 @@ class DoclingClassifier:
             )
 
         return classifications
+
+    def get_structure_boxes(
+        self,
+        page_no: int,
+        page_image_size: Tuple[int, int],
+    ) -> List[Tuple[int, int, int, int]]:
+        """Return pixel-coordinate bounding boxes for structure regions on a page.
+
+        Must be called after classify_pdf() or detect_structure_pages().
+        Converts Docling's point-based coordinates to pixel coordinates
+        matching the rendered page image.
+
+        Args:
+            page_no: 1-indexed page number.
+            page_image_size: (width, height) of the rendered page image in pixels.
+
+        Returns:
+            List of (x1, y1, x2, y2) bounding boxes in pixel coordinates
+            for regions classified as structure-like (picture, formula, chart).
+        """
+        clusters = self._cached_layout.get(page_no, [])
+        if not clusters:
+            return []
+
+        img_w, img_h = page_image_size
+
+        # Get page dimensions in points for coordinate scaling
+        page_dims = self._cached_page_dims.get(page_no)
+
+        boxes = []
+        for label, conf, bbox in clusters:
+            if label not in _STRUCTURE_LABELS:
+                continue
+
+            if page_dims is not None:
+                page_w_pts, page_h_pts = page_dims
+                # Convert from Docling BoundingBox to pixel coordinates.
+                # Use Docling's built-in methods for correct origin handling.
+                try:
+                    # Ensure TOPLEFT origin, then scale to pixel dimensions
+                    from docling_core.types.doc.base import CoordOrigin
+                    if bbox.coord_origin == CoordOrigin.BOTTOMLEFT:
+                        tl_bbox = bbox.to_top_left_origin(page_height=page_h_pts)
+                    else:
+                        tl_bbox = bbox
+
+                    # Scale from points to pixel coordinates
+                    scale_x = img_w / page_w_pts
+                    scale_y = img_h / page_h_pts
+                    x1 = int(tl_bbox.l * scale_x)
+                    y1 = int(tl_bbox.t * scale_y)
+                    x2 = int(tl_bbox.r * scale_x)
+                    y2 = int(tl_bbox.b * scale_y)
+                except Exception:
+                    # Fallback: try direct attribute access with scaling
+                    scale_x = img_w / page_w_pts
+                    scale_y = img_h / page_h_pts
+                    x1 = int(bbox.l * scale_x)
+                    y1 = int(bbox.t * scale_y)
+                    x2 = int(bbox.r * scale_x)
+                    y2 = int(bbox.b * scale_y)
+            else:
+                # No page dimensions cached — try using bbox directly
+                # assuming coordinates are already in a usable system
+                x1, y1, x2, y2 = int(bbox.l), int(bbox.t), int(bbox.r), int(bbox.b)
+
+            # Ensure correct ordering (y1 < y2)
+            if y1 > y2:
+                y1, y2 = y2, y1
+            if x1 > x2:
+                x1, x2 = x2, x1
+
+            # Clamp to image bounds
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(img_w, x2)
+            y2 = min(img_h, y2)
+
+            # Skip degenerate boxes
+            if x2 - x1 < 10 or y2 - y1 < 10:
+                continue
+
+            boxes.append((x1, y1, x2, y2))
+
+        return boxes
 
     def classify_page(self, pil_image: Image.Image) -> PageClassification:
         """Classify a single page image.

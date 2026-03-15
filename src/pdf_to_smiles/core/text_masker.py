@@ -34,7 +34,15 @@ _ATOM_LABEL_RE = re.compile(
 
 
 def is_available() -> bool:
-    """Check if PaddleOCR is installed and usable."""
+    """Check if PaddleOCR is installed and usable.
+
+    Returns False when called from a non-main thread because PaddlePaddle's
+    protobuf C++ static initialisers in libphi_core.dylib crash (SIGABRT)
+    when first loaded via dlopen on a background thread.
+    """
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        return False
     try:
         import paddleocr  # noqa: F401
         return True

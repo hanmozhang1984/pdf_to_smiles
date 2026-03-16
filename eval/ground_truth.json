@@ -57,6 +57,83 @@
         {"page": 2, "expected_count": 3, "examples": "12-14", "notes": "TABLE 11-continued, 3 rows"},
         {"page": 3, "expected_count": 0, "examples": "", "notes": "TABLE 21-continued + TABLE 22, numeric data only"}
       ]
+    },
+    {
+      "id": "TREM2",
+      "filename": "US11608344.pdf",
+      "notes": "Dense 2-column TABLE A pages + TABLE 8A grid. 415 pages total.",
+      "pages": [
+        {"page": 105, "expected_count": 8, "examples": "", "notes": "dense 2-col TABLE A"},
+        {"page": 110, "expected_count": 9, "examples": "", "notes": "dense 2-col TABLE A"},
+        {"page": 300, "expected_count": 4, "examples": "246-249", "notes": "TABLE 8A-continued"},
+        {"page": 385, "expected_count": 3, "examples": "", "notes": "synthesis structures, not invention examples"},
+        {"page": 395, "expected_count": 0, "examples": "", "notes": "TABLE 19, numeric data only"}
+      ]
+    },
+    {
+      "id": "HER2",
+      "filename": "US20230041385A1.pdf",
+      "notes": "TABLE 2/3 grids + dense structure pages. 263 pages total.",
+      "pages": [
+        {"page": 85, "expected_count": 4, "examples": "64-67", "notes": "TABLE 2-continued"},
+        {"page": 86, "expected_count": 4, "examples": "68-71", "notes": "TABLE 2-continued"},
+        {"page": 205, "expected_count": 3, "examples": "415-417", "notes": "TABLE 3-continued"},
+        {"page": 255, "expected_count": 1, "examples": "", "notes": "single structure, not invention example"},
+        {"page": 256, "expected_count": 1, "examples": "", "notes": "single structure, not invention example"}
+      ]
+    },
+    {
+      "id": "GLP1",
+      "filename": "US10934279.pdf",
+      "notes": "Free-form synthesis pages + TABLE 1 grid. 119 pages total.",
+      "pages": [
+        {"page": 31, "expected_count": 2, "examples": "", "notes": "synthesis page, intermediates + product"},
+        {"page": 55, "expected_count": 2, "examples": "", "notes": "mixed content, 2 structures"},
+        {"page": 85, "expected_count": 2, "examples": "14", "notes": "intermediate + Example 14, correctly segregated"},
+        {"page": 93, "expected_count": 5, "examples": "27-31", "notes": "TABLE 1-continued"},
+        {"page": 95, "expected_count": 5, "examples": "37-41", "notes": "TABLE 1-continued"}
+      ]
+    },
+    {
+      "id": "D5D",
+      "filename": "HK40078922A.pdf",
+      "notes": "Wide 4-column Table 7 + reaction scheme pages. 226 pages total.",
+      "pages": [
+        {"page": 104, "expected_count": 2, "examples": "4-5", "notes": "Table 7, wide 4-col"},
+        {"page": 105, "expected_count": 2, "examples": "6-7", "notes": "Table 7, wide 4-col"},
+        {"page": 155, "expected_count": 1, "examples": "88", "notes": "reaction scheme, single structure"},
+        {"page": 182, "expected_count": 0, "examples": "", "notes": "Table 15, numeric data only"}
+      ]
+    },
+    {
+      "id": "KIF18",
+      "filename": "WO2021026098A1_kif18pages.pdf",
+      "notes": "Grid table with chemical structures + chemical names. 3-page excerpt.",
+      "pages": [
+        {"page": 1, "expected_count": 4, "examples": "100, 100-7, 100-11, 100-13", "notes": "grid table, 4 rows"}
+      ]
+    },
+    {
+      "id": "Frontier",
+      "filename": "Frontier P53YC/WO2025235957 Y220C vinyl pyridine Frontier (1).pdf",
+      "notes": "Y220C vinyl pyridine patent (WO 2025/235957). Table 1 has 2-column layout (Cpd.#/Structure), 12-14 structures per page. Table 2 has 4-column intermediate grid.",
+      "pages": [
+        {"page": 50, "expected_count": 0, "examples": "", "notes": "text only, no structures"},
+        {"page": 100, "expected_count": 0, "examples": "", "notes": "text with inline Markush fragments, not in tables"},
+        {"page": 105, "expected_count": 14, "examples": "30-43", "notes": "first full Table 1 page, 7 per column"},
+        {"page": 107, "expected_count": 14, "examples": "58-71", "notes": "7 per column"},
+        {"page": 110, "expected_count": 12, "examples": "100-110a", "notes": "6 per column, has non-numeric ID '110a'"},
+        {"page": 115, "expected_count": 12, "examples": "204-215", "notes": "6 per column"},
+        {"page": 120, "expected_count": 12, "examples": "264-276", "notes": "6 per column"},
+        {"page": 140, "expected_count": 14, "examples": "514-527", "notes": "7 per column"},
+        {"page": 160, "expected_count": 12, "examples": "761-772", "notes": "6 per column"},
+        {"page": 170, "expected_count": 12, "examples": "888-899", "notes": "6 per column"},
+        {"page": 175, "expected_count": 13, "examples": "949-961", "notes": "7 left + 6 right"},
+        {"page": 176, "expected_count": 14, "examples": "962-975", "notes": "7 per column"},
+        {"page": 177, "expected_count": 18, "examples": "976-981", "notes": "MIXED: Table 1 end (6 examples) + Table 2 start (12 intermediates in 4-col grid)"},
+        {"page": 178, "expected_count": 24, "examples": "", "notes": "Table 2 continued, 4-column grid, all intermediates (no examples)"},
+        {"page": 180, "expected_count": 0, "examples": "", "notes": "text only, no structures"}
+      ]
     }
   ]
 }

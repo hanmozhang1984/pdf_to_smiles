@@ -41,17 +41,26 @@ class DoclingDetector:
     _STRUCTURE_INK_CELL_THRESHOLD = 0.005  # min dark ratio per cell
 
     # Minimum row height for a candidate structure cell (px at 200 DPI).
-    # Header rows are typically 40-110 px; real structure cells are 200+.
-    _MIN_STRUCTURE_ROW_HEIGHT = 160
+    # Header rows are typically 40-110 px; real structure cells are 155+.
+    # Set to 155 to catch compact table rows (e.g. GLP1 158px cells).
+    _MIN_STRUCTURE_ROW_HEIGHT = 155
+
+    # Minimum sub-box height after splitting a compound box. Slightly
+    # higher than _MIN_STRUCTURE_ROW_HEIGHT to avoid over-splitting.
+    _MIN_SPLIT_HEIGHT = 160
 
     # Template matching — threshold is intentionally low because different
     # chemical structures have near-zero cross-correlation; we only want
     # to reject truly anti-correlated (inverted/blank) regions.
     _TEMPLATE_SIMILARITY_THRESHOLD = -0.3
 
-    # Keyword for table caption/header scanning — only "structure" is safe;
-    # "example" and "table \d" also match text-only tables (TABLE 2, TABLE 3).
-    _TABLE_CAPTION_KEYWORDS = re.compile(r"structure", re.IGNORECASE)
+    # Keywords for table caption/header scanning.  "structure" is the primary
+    # trigger; "compound" / "cpd" are secondary (guarded by validation).
+    # Avoid "example" alone — it matches numeric data tables (TABLE 19 etc.).
+    _TABLE_CAPTION_KEYWORDS = re.compile(
+        r"structure|compound|cpd\.?\s*[#\d]",
+        re.IGNORECASE,
+    )
 
     def __init__(self, docling_classifier):
         """Initialize with a DoclingClassifier that has cached layout data.
@@ -61,7 +70,7 @@ class DoclingDetector:
                 processed the PDF (layout clusters are cached).
         """
         self._classifier = docling_classifier
-        self._table_row_cache = None  # (x_left, x_right) — structure column X-range
+        self._table_row_cache = None  # List[(x_left, x_right)] — structure column X-ranges
         self._template_crop = None   # grayscale np.array of a known structure
 
     def detect_structures_with_boxes(
@@ -84,6 +93,7 @@ class DoclingDetector:
         boxes = self._fill_table_gaps(boxes, page_image, page_num)
         boxes = self._scan_example_tables(boxes, page_image, page_num)
         boxes = self._close_row_gaps(boxes, page_num, page_image.size)
+        boxes = self._fill_column_gaps(boxes, page_image, page_num)
         boxes = self._split_compound_boxes(boxes, page_image, page_num)
         if not boxes:
             return []
@@ -106,6 +116,55 @@ class DoclingDetector:
             page_num, len(results),
         )
         return results
+
+    # ------------------------------------------------------------------
+    # Pre-processing: filter page-spanning layout artifacts
+    # ------------------------------------------------------------------
+
+    def _filter_page_spanning_boxes(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        page_num: int,
+        page_image_size: Tuple[int, int],
+    ) -> List[Tuple[int, int, int, int]]:
+        """Remove raw boxes that span >70% of page height and aren't in tables.
+
+        Docling sometimes labels full-page columns as "picture" — these are
+        layout artifacts, not individual structures.  Boxes inside table
+        regions are kept (they'll be decomposed into rows later).
+        """
+        if not boxes:
+            return boxes
+
+        img_w, img_h = page_image_size
+        table_boxes = self._get_table_boxes(page_num, page_image_size)
+        threshold_h = img_h * 0.7
+
+        filtered = []
+        for box in boxes:
+            bh = box[3] - box[1]
+            bw = box[2] - box[0]
+            if bh > threshold_h and not self._box_inside_any_table(box, table_boxes):
+                # Check if the box itself IS a table (same coords)
+                is_table = any(
+                    abs(box[0] - tb[0]) < 30 and abs(box[1] - tb[1]) < 30
+                    and abs(box[2] - tb[2]) < 30 and abs(box[3] - tb[3]) < 30
+                    for tb in table_boxes
+                )
+                # Keep wide boxes — they may be grids for decomposition
+                is_wide = bw > 800
+                if is_table or is_wide:
+                    filtered.append(box)
+                else:
+                    logger.debug(
+                        "_filter_page_spanning_boxes: removed (%d,%d,%d,%d) h=%d "
+                        "(>70%% of page height %d)",
+                        *box, bh, img_h,
+                    )
+            else:
+                filtered.append(box)
+
+        return filtered
 
     # ------------------------------------------------------------------
     # Post-processing: merge horizontally-split boxes
@@ -405,6 +464,33 @@ class DoclingDetector:
 
         return sorted(set(refined))
 
+    @staticmethod
+    def _merge_short_row_segments(
+        row_bounds: List[int], min_height: int,
+    ) -> List[int]:
+        """Merge row segments shorter than min_height with their successor.
+
+        Tables with internal separator lines (e.g. between example number
+        and structure drawing) create segments like [42px, 158px, 43px, 161px].
+        This merges the short segments downward: remove the boundary between
+        a short segment and the next one, combining them into one taller cell.
+        The first and last boundaries are always preserved.
+        """
+        if len(row_bounds) < 3:
+            return list(row_bounds)
+
+        merged = [row_bounds[0]]
+        i = 1
+        while i < len(row_bounds):
+            seg_h = row_bounds[i] - merged[-1]
+            if seg_h < min_height and i < len(row_bounds) - 1:
+                # Skip this boundary — merge this short segment with the next
+                i += 1
+                continue
+            merged.append(row_bounds[i])
+            i += 1
+        return merged
+
     def _detect_table_column_boundaries(
         self, page_image: Image.Image,
         tx1: int, ty1: int, tx2: int, ty2: int,
@@ -442,35 +528,56 @@ class DoclingDetector:
         abs_positions = sorted(set([tx1] + [tx1 + p for p in positions] + [tx2]))
         return self._merge_close_boundaries(abs_positions)
 
-    def _identify_structure_column(
+    def _identify_structure_columns(
         self, col_boundaries: List[int],
         boxes: List[Tuple], inside_idxs: List[int],
-    ) -> Tuple[int, int]:
-        """Return (x_left, x_right) of the structure column."""
+    ) -> List[Tuple[int, int]]:
+        """Return list of (x_left, x_right) for all structure columns.
+
+        Identifies every column that contains the center of at least one
+        detected structure box.  Falls back to cached columns, and finally
+        to a heuristic (all columns except the narrowest / first).
+        """
+        if len(col_boundaries) < 2:
+            return [(col_boundaries[0], col_boundaries[-1])] if col_boundaries else []
+
+        # Build list of column ranges
+        col_ranges = [
+            (col_boundaries[k], col_boundaries[k + 1])
+            for k in range(len(col_boundaries) - 1)
+        ]
+
         if inside_idxs:
             mid_xs = [(boxes[i][0] + boxes[i][2]) / 2 for i in inside_idxs]
-            avg_mid = sum(mid_xs) / len(mid_xs)
-            for k in range(len(col_boundaries) - 1):
-                if col_boundaries[k] <= avg_mid <= col_boundaries[k + 1]:
-                    return col_boundaries[k], col_boundaries[k + 1]
+            hit_cols = set()
+            for mx in mid_xs:
+                for k, (cl, cr) in enumerate(col_ranges):
+                    if cl <= mx <= cr:
+                        hit_cols.add(k)
+                        break
+            if hit_cols:
+                return [col_ranges[k] for k in sorted(hit_cols)]
 
-        # Fallback: use cached column range
+        # Fallback: use cached column ranges
         if self._table_row_cache is not None:
-            cached_x_left, cached_x_right = self._table_row_cache
-            cached_mid = (cached_x_left + cached_x_right) / 2
-            for k in range(len(col_boundaries) - 1):
-                if col_boundaries[k] <= cached_mid <= col_boundaries[k + 1]:
-                    return col_boundaries[k], col_boundaries[k + 1]
+            matched = []
+            for cached_xl, cached_xr in self._table_row_cache:
+                cached_mid = (cached_xl + cached_xr) / 2
+                for cl, cr in col_ranges:
+                    if cl <= cached_mid <= cr:
+                        if (cl, cr) not in matched:
+                            matched.append((cl, cr))
+                        break
+            if matched:
+                return matched
 
-        # Fallback: second column (patent tables are always
-        # Example | Structure | Name | ...).  Border-artifact columns
-        # have been merged away by _merge_close_boundaries so index 1
-        # reliably points to the Structure column.
-        if len(col_boundaries) >= 3:
-            return col_boundaries[1], col_boundaries[2]
+        # Conservative fallback: second column only (patent tables are
+        # typically Example | Structure | Name | ...).
+        if len(col_ranges) >= 2:
+            return [col_ranges[1]]
 
         # Last resort: full table width
-        return col_boundaries[0], col_boundaries[-1]
+        return [(col_boundaries[0], col_boundaries[-1])]
 
     def _fill_table_gaps(
         self,
@@ -518,16 +625,43 @@ class DoclingDetector:
                     boxes, inside_idxs, ty1, ty2,
                 )
 
-            # Identify structure column
-            x_left, x_right = self._identify_structure_column(
+            # Extend table bottom if last boundary is suspiciously close to
+            # the Docling table edge — gives the last row room to breathe.
+            img_h = page_image.size[1]
+            if len(row_bounds) >= 2:
+                last_b = row_bounds[-1]
+                if last_b - row_bounds[-2] < self._MIN_STRUCTURE_ROW_HEIGHT:
+                    extend = min(50, img_h - last_b)
+                    if extend > 0:
+                        row_bounds[-1] = last_b + extend
+
+            # Identify structure columns (may be >1 for multi-column tables)
+            struct_cols = self._identify_structure_columns(
                 col_bounds, boxes, inside_idxs,
             )
 
-            # Cache structure column X-range for cross-page rescue
-            self._table_row_cache = (x_left, x_right)
+            # Cache structure column X-ranges for cross-page rescue
+            self._table_row_cache = struct_cols
             self._template_crop = np.array(
                 page_image.crop(boxes[inside_idxs[0]]).convert("L")
             )
+
+            # Detect oversized boxes: if any inside box covers >80% of the
+            # table height and we have ≥3 row boundaries, remove it so it
+            # gets decomposed into per-row candidates below.
+            table_h = ty2 - ty1
+            if len(row_bounds) >= 3:
+                oversized = set()
+                for idx in inside_idxs:
+                    bh = boxes[idx][3] - boxes[idx][1]
+                    if bh > table_h * 0.8:
+                        oversized.add(boxes[idx])
+                if oversized:
+                    new_boxes = [b for b in new_boxes if b not in oversized]
+                    logger.debug(
+                        "_fill_table_gaps: page %d decomposing %d oversized boxes into rows",
+                        page_num, len(oversized),
+                    )
 
             # Skip the header row (first segment) — data rows start from
             # the second row segment onward
@@ -536,30 +670,41 @@ class DoclingDetector:
             for r in range(data_start, len(row_bounds) - 1):
                 cand_y1 = row_bounds[r]
                 cand_y2 = row_bounds[r + 1]
-                cand_x1 = max(0, x_left)
-                cand_x2 = min(page_image.size[0], x_right)
+                row_h = cand_y2 - cand_y1
+                is_last_row = (r == len(row_bounds) - 2)
 
-                if cand_x2 - cand_x1 < 10 or cand_y2 - cand_y1 < self._MIN_STRUCTURE_ROW_HEIGHT:
-                    continue
+                for x_left, x_right in struct_cols:
+                    cand_x1 = max(0, x_left)
+                    cand_x2 = min(page_image.size[0], x_right)
 
-                # Check if any existing box already covers this row
-                row_cy = (cand_y1 + cand_y2) / 2
-                x_mid = (cand_x1 + cand_x2) / 2
-                covered = False
-                for bx1, by1, bx2, by2 in new_boxes:
-                    if by1 <= row_cy <= by2 and bx1 <= x_mid <= bx2:
-                        covered = True
-                        break
+                    if cand_x2 - cand_x1 < 10:
+                        continue
 
-                if not covered:
-                    if self._validate_candidate(
-                        page_image, cand_x1, cand_y1, cand_x2, cand_y2,
-                    ):
-                        new_boxes.append((cand_x1, cand_y1, cand_x2, cand_y2))
-                        logger.debug(
-                            "_fill_table_gaps: added synthetic box (%d,%d,%d,%d) on page %d",
-                            cand_x1, cand_y1, cand_x2, cand_y2, page_num,
-                        )
+                    # Apply relaxed height threshold for last row (Fix 3)
+                    min_h = self._MIN_STRUCTURE_ROW_HEIGHT
+                    if is_last_row and row_h >= 100:
+                        min_h = 100
+                    if row_h < min_h:
+                        continue
+
+                    # Check if any existing box already covers this cell
+                    row_cy = (cand_y1 + cand_y2) / 2
+                    x_mid = (cand_x1 + cand_x2) / 2
+                    covered = False
+                    for bx1, by1, bx2, by2 in new_boxes:
+                        if by1 <= row_cy <= by2 and bx1 <= x_mid <= bx2:
+                            covered = True
+                            break
+
+                    if not covered:
+                        if self._validate_candidate(
+                            page_image, cand_x1, cand_y1, cand_x2, cand_y2,
+                        ):
+                            new_boxes.append((cand_x1, cand_y1, cand_x2, cand_y2))
+                            logger.debug(
+                                "_fill_table_gaps: added synthetic box (%d,%d,%d,%d) on page %d",
+                                cand_x1, cand_y1, cand_x2, cand_y2, page_num,
+                            )
 
         if len(new_boxes) > len(boxes):
             logger.debug(
@@ -666,7 +811,17 @@ class DoclingDetector:
                 )
                 continue
 
-            if not self._TABLE_CAPTION_KEYWORDS.search(caption_text):
+            keyword_matched = bool(self._TABLE_CAPTION_KEYWORDS.search(caption_text))
+            # Allow cache-based rescue for continuation pages: if the cache
+            # exists and its column range overlaps the table, proceed even
+            # without keyword match.
+            cache_compatible = False
+            if not keyword_matched and self._table_row_cache is not None:
+                for cached_xl, cached_xr in self._table_row_cache:
+                    if cached_xl >= tx1 and cached_xr <= tx2:
+                        cache_compatible = True
+                        break
+            if not keyword_matched and not cache_compatible:
                 logger.debug(
                     "_scan_example_tables: page %d table caption has no keywords: %r",
                     page_num, caption_text.strip(),
@@ -689,18 +844,10 @@ class DoclingDetector:
             # Fallback: if line detection found too few rows, use pitch estimate
             if len(row_bounds) < 3:
                 table_h = ty2 - ty1
-                if self._table_row_cache is not None:
-                    # Use cached structure column width to estimate pitch
-                    cached_x_left, cached_x_right = self._table_row_cache
-                    header_offset = int(table_h * 0.07)
-                    usable_h = table_h - header_offset
-                    est_rows = max(2, min(6, round(usable_h / 400)))
-                    pitch = usable_h / est_rows
-                else:
-                    header_offset = int(table_h * 0.07)
-                    usable_h = table_h - header_offset
-                    est_rows = max(2, min(6, round(usable_h / 400)))
-                    pitch = usable_h / est_rows
+                header_offset = int(table_h * 0.07)
+                usable_h = table_h - header_offset
+                est_rows = max(2, min(6, round(usable_h / 400)))
+                pitch = usable_h / est_rows
 
                 row_bounds = [ty1 + header_offset]
                 y = ty1 + header_offset + pitch
@@ -711,48 +858,67 @@ class DoclingDetector:
                     row_bounds.append(ty2)
                 row_bounds = sorted(set([ty1] + row_bounds))
 
-            # Identify structure column
-            x_left, x_right = self._identify_structure_column(
+            # Identify structure columns
+            struct_cols = self._identify_structure_columns(
                 col_bounds, boxes, [],
             )
 
-            # If no cache yet, use full table width with margins as fallback
+            # If no cache yet and few columns, use full table width with margins
             if self._table_row_cache is None and len(col_bounds) < 3:
                 margin = int((tx2 - tx1) * 0.05)
-                x_left = tx1 + margin
-                x_right = tx2 - margin
+                struct_cols = [(tx1 + margin, tx2 - margin)]
 
-            # Cache structure column X-range for subsequent pages
-            self._table_row_cache = (x_left, x_right)
+            # Cache structure column X-ranges for subsequent pages
+            self._table_row_cache = struct_cols
 
             # Skip the header row
             data_start = 1 if len(row_bounds) > 2 else 0
 
+            # Collect candidates from all structure columns
+            table_candidates = []
             for r in range(data_start, len(row_bounds) - 1):
                 cand_y1 = row_bounds[r]
                 cand_y2 = row_bounds[r + 1]
-                cand_x1 = max(0, x_left)
-                cand_x2 = min(page_image.size[0], x_right)
+                row_h = cand_y2 - cand_y1
+                is_last_row = (r == len(row_bounds) - 2)
 
-                if cand_x2 - cand_x1 < 10 or cand_y2 - cand_y1 < self._MIN_STRUCTURE_ROW_HEIGHT:
-                    continue
+                for x_left, x_right in struct_cols:
+                    cand_x1 = max(0, x_left)
+                    cand_x2 = min(page_image.size[0], x_right)
 
-                # Check not already covered
-                row_cy = (cand_y1 + cand_y2) / 2
-                x_mid = (cand_x1 + cand_x2) / 2
-                covered = False
-                for bx1, by1, bx2, by2 in new_boxes:
-                    if by1 <= row_cy <= by2 and bx1 <= x_mid <= bx2:
-                        covered = True
-                        break
+                    if cand_x2 - cand_x1 < 10:
+                        continue
 
-                if not covered and self._validate_candidate(
-                    page_image, cand_x1, cand_y1, cand_x2, cand_y2,
-                ):
-                    new_boxes.append((cand_x1, cand_y1, cand_x2, cand_y2))
+                    # Apply relaxed height threshold for last row (Fix 3)
+                    min_h = self._MIN_STRUCTURE_ROW_HEIGHT
+                    if is_last_row and row_h >= 100:
+                        min_h = 100
+                    if row_h < min_h:
+                        continue
+
+                    # Check not already covered
+                    row_cy = (cand_y1 + cand_y2) / 2
+                    x_mid = (cand_x1 + cand_x2) / 2
+                    covered = False
+                    for bx1, by1, bx2, by2 in new_boxes:
+                        if by1 <= row_cy <= by2 and bx1 <= x_mid <= bx2:
+                            covered = True
+                            break
+
+                    if not covered and self._validate_candidate(
+                        page_image, cand_x1, cand_y1, cand_x2, cand_y2,
+                    ):
+                        table_candidates.append((cand_x1, cand_y1, cand_x2, cand_y2))
+
+            # Guard: cache-based rescue (no keyword match) requires ≥2
+            # validated candidates to avoid false positives from text tables.
+            min_candidates = 2 if (not keyword_matched and cache_compatible) else 1
+            if len(table_candidates) >= min_candidates:
+                new_boxes.extend(table_candidates)
+                for cand in table_candidates:
                     logger.debug(
                         "_scan_example_tables: added synthetic box (%d,%d,%d,%d) on page %d",
-                        cand_x1, cand_y1, cand_x2, cand_y2, page_num,
+                        *cand, page_num,
                     )
 
         if len(new_boxes) > len(boxes):
@@ -817,6 +983,103 @@ class DoclingDetector:
         return result
 
     # ------------------------------------------------------------------
+    # Post-processing: fill gaps in multi-column layouts
+    # ------------------------------------------------------------------
+
+    def _fill_column_gaps(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        page_image: Image.Image,
+        page_num: int,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Fill missing positions in a regular multi-column grid layout.
+
+        When ≥6 boxes form a 2-column grid with regular vertical pitch,
+        check for missing grid positions and add validated candidates.
+        Only runs on pages without table regions (i.e., Docling detected
+        the structures as individual boxes, not as a table).
+        """
+        table_boxes = self._get_table_boxes(page_num, page_image.size)
+        if table_boxes or len(boxes) < 6:
+            return boxes
+
+        img_w = page_image.size[0]
+        mid_x = img_w / 2
+
+        # Split into left/right columns
+        left = sorted([b for b in boxes if (b[0] + b[2]) / 2 < mid_x],
+                       key=lambda b: b[1])
+        right = sorted([b for b in boxes if (b[0] + b[2]) / 2 >= mid_x],
+                        key=lambda b: b[1])
+
+        if len(left) < 2 or len(right) < 2:
+            return boxes
+
+        # Compute average box dimensions and pitch for each column
+        new_boxes = list(boxes)
+
+        for col_boxes in [left, right]:
+            avg_w = int(sum(b[2] - b[0] for b in col_boxes) / len(col_boxes))
+            avg_h = int(sum(b[3] - b[1] for b in col_boxes) / len(col_boxes))
+            avg_x1 = int(sum(b[0] for b in col_boxes) / len(col_boxes))
+            avg_x2 = avg_x1 + avg_w
+
+            if len(col_boxes) < 2:
+                continue
+
+            # Compute pitch from consecutive boxes
+            pitches = [col_boxes[i + 1][1] - col_boxes[i][1]
+                       for i in range(len(col_boxes) - 1)]
+            avg_pitch = sum(pitches) / len(pitches)
+            if avg_pitch < 100:
+                continue
+
+            # Check for gaps: walk from top of other column to bottom
+            # and look for missing positions
+            other = right if col_boxes is left else left
+            if not other:
+                continue
+
+            # Try to find a missing position above the first box
+            first_y = col_boxes[0][1]
+            if other and other[0][1] < first_y - avg_pitch * 0.5:
+                # There might be a row above the first detection
+                cand_y1 = first_y - int(avg_pitch)
+                cand_y2 = cand_y1 + avg_h
+                if cand_y1 >= 0 and cand_y2 > cand_y1:
+                    if self._validate_candidate(
+                        page_image, avg_x1, cand_y1, avg_x2, cand_y2,
+                    ):
+                        new_boxes.append((avg_x1, cand_y1, avg_x2, cand_y2))
+                        logger.debug(
+                            "_fill_column_gaps: added (%d,%d,%d,%d) on page %d",
+                            avg_x1, cand_y1, avg_x2, cand_y2, page_num,
+                        )
+
+            # Check for gaps between consecutive boxes
+            for i in range(len(col_boxes) - 1):
+                gap = col_boxes[i + 1][1] - col_boxes[i][3]
+                if gap > avg_pitch * 0.5:
+                    cand_y1 = col_boxes[i][3]
+                    cand_y2 = cand_y1 + avg_h
+                    if self._validate_candidate(
+                        page_image, avg_x1, cand_y1, avg_x2, cand_y2,
+                    ):
+                        new_boxes.append((avg_x1, cand_y1, avg_x2, cand_y2))
+                        logger.debug(
+                            "_fill_column_gaps: added (%d,%d,%d,%d) on page %d",
+                            avg_x1, cand_y1, avg_x2, cand_y2, page_num,
+                        )
+
+        if len(new_boxes) > len(boxes):
+            logger.debug(
+                "_fill_column_gaps: page %d — added %d boxes",
+                page_num, len(new_boxes) - len(boxes),
+            )
+
+        return new_boxes
+
+    # ------------------------------------------------------------------
     # Post-processing: split compound boxes (tall or wide)
     # ------------------------------------------------------------------
 
@@ -850,6 +1113,23 @@ class DoclingDetector:
             x1, y1, x2, y2 = box
             bw = x2 - x1
             bh = y2 - y1
+
+            # --- Case 0: Large grid box → decompose into grid cells ---
+            # A box that's both wide (>800px) and tall (>500px) and not
+            # inside a table may be a grid of small structures.
+            if (bw > 800 and bh > 500
+                    and not self._box_inside_any_table(box, table_boxes)):
+                grid_cells = self._try_grid_decompose(
+                    page_image, x1, y1, x2, y2,
+                )
+                if grid_cells is not None:
+                    result.extend(grid_cells)
+                    logger.debug(
+                        "_split_compound_boxes: page %d grid box (%d,%d,%d,%d) "
+                        "→ decomposed into %d cells",
+                        page_num, x1, y1, x2, y2, len(grid_cells),
+                    )
+                    continue
 
             # --- Case 1: Tall box → horizontal split ---
             if bh > self._MAX_ROW_SEGMENT_HEIGHT:
@@ -916,8 +1196,8 @@ class DoclingDetector:
         box_b = (x1, split_y, x2, y2)
 
         # Both sub-boxes must have sufficient height
-        if (split_y - y1 < self._MIN_STRUCTURE_ROW_HEIGHT
-                or y2 - split_y < self._MIN_STRUCTURE_ROW_HEIGHT):
+        if (split_y - y1 < self._MIN_SPLIT_HEIGHT
+                or y2 - split_y < self._MIN_SPLIT_HEIGHT):
             return None
 
         # Both sub-boxes must pass structure ink validation
@@ -978,6 +1258,53 @@ class DoclingDetector:
                 and self._has_structure_ink(page_image, *box_b)):
             return [box_a, box_b]
 
+        return None
+
+    def _try_grid_decompose(
+        self, page_image: Image.Image,
+        x1: int, y1: int, x2: int, y2: int,
+    ) -> Optional[List[Tuple[int, int, int, int]]]:
+        """Decompose a large box into grid cells using line detection.
+
+        For boxes that contain a grid of small structures (e.g. intermediate
+        tables in patent documents), detect internal row/column separators
+        and generate individual cell candidates.
+
+        Returns a list of validated cell boxes, or None if the box doesn't
+        appear to be a grid (fewer than 2 columns or 2 rows detected).
+        """
+        row_bounds = self._detect_table_row_boundaries(
+            page_image, x1, y1, x2, y2,
+        )
+        col_bounds = self._detect_table_column_boundaries(
+            page_image, x1, y1, x2, y2,
+        )
+
+        # Need at least a 2x2 grid to consider this a grid box
+        if len(row_bounds) < 3 or len(col_bounds) < 3:
+            return None
+
+        cells = []
+        # Don't skip first row — the grid box typically starts below headers
+
+        for r in range(len(row_bounds) - 1):
+            ry1 = row_bounds[r]
+            ry2 = row_bounds[r + 1]
+            if ry2 - ry1 < 100:
+                continue
+
+            for c in range(len(col_bounds) - 1):
+                cx1 = col_bounds[c]
+                cx2 = col_bounds[c + 1]
+                if cx2 - cx1 < 80:
+                    continue
+
+                if self._validate_candidate(page_image, cx1, ry1, cx2, ry2):
+                    cells.append((cx1, ry1, cx2, ry2))
+
+        # Only return grid cells if we found a reasonable number
+        if len(cells) >= 4:
+            return cells
         return None
 
     @staticmethod

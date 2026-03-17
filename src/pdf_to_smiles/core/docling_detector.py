@@ -28,7 +28,11 @@ class DoclingDetector:
     """
 
     STRUCTURE_LABELS = {"picture", "formula", "chart"}
-    PADDING_PX = 15
+    PADDING_PX = 30
+
+    # Inward margin from detected separator lines for candidate generation (Y-axis only).
+    # Avoids including separator line pixels in validation region.
+    _CELL_INWARD_MARGIN_Y = 8
 
     # Thresholds for _merge_split_boxes
     _MERGE_Y_OVERLAP_RATIO = 0.3
@@ -53,6 +57,29 @@ class DoclingDetector:
     # chemical structures have near-zero cross-correlation; we only want
     # to reject truly anti-correlated (inverted/blank) regions.
     _TEMPLATE_SIMILARITY_THRESHOLD = -0.3
+
+    # Adaptive row boundary anchoring thresholds
+    _REFINE_SEARCH_ABOVE = 0          # px above boundary to search for example numbers
+    _REFINE_SEARCH_BELOW = 50         # px below boundary to search (asymmetric: numbers are below gap center)
+    _REFINE_MARGIN_ABOVE_INK = 5      # px margin above detected ink top for new boundary
+    _REFINE_MIN_CONFIRMED = 2         # min boundaries with nearby ink to activate refinement
+    _REFINE_MIN_CONFIRMED_RATIO = 0.45  # min fraction of internal boundaries confirmed
+    _EXAMPLE_COL_WIDTH_RATIO = 0.15   # fraction of table width for example column heuristic
+    _EXAMPLE_COL_MIN_PX = 60          # minimum example column width (px)
+    _EXAMPLE_COL_MAX_PX = 150         # maximum example column width (px)
+
+    # Tighten horizontal bounds via vertical ink density gap detection
+    _TIGHTEN_GAP_DENSITY = 0.005       # max density to qualify as a vertical gap
+    _TIGHTEN_GAP_MIN_WIDTH = 15        # min gap width in pixels
+    _TIGHTEN_SEARCH_LEFT = 0.30        # right-gap search starts at 30% of table width
+    _TIGHTEN_SEARCH_RIGHT = 0.80       # right-gap search ends at 80% of table width
+    _TIGHTEN_MIN_RESULT_RATIO = 0.25   # tightened column must be >= 25% of table width
+    _TIGHTEN_SMOOTH_KERNEL = 21        # smoothing kernel width for density profile
+
+    # Ink extension — extend boxes vertically to capture truncated structure elements
+    _INK_EXTEND_MAX_PX = 60            # max pixels to scan beyond box edge
+    _INK_EXTEND_MIN_DENSITY = 0.008    # min ink density in a row to count as content
+    _INK_EXTEND_GAP_ROWS = 5          # consecutive empty rows to stop extending
 
     # Keywords for table caption/header scanning.  "structure" is the primary
     # trigger; "compound" / "cpd" are secondary (guarded by validation).
@@ -95,6 +122,7 @@ class DoclingDetector:
         boxes = self._close_row_gaps(boxes, page_num, page_image.size)
         boxes = self._fill_column_gaps(boxes, page_image, page_num)
         boxes = self._split_compound_boxes(boxes, page_image, page_num)
+        boxes = self._extend_boxes_to_ink(boxes, page_image)
         if not boxes:
             return []
 
@@ -491,6 +519,119 @@ class DoclingDetector:
             i += 1
         return merged
 
+    def _refine_row_boundaries(
+        self,
+        page_image: Image.Image,
+        row_bounds: List[int],
+        tx1: int, ty1: int, tx2: int, ty2: int,
+        col_bounds: List[int],
+    ) -> List[int]:
+        """Shift internal row boundaries to just above example number ink.
+
+        Patent tables have example numbers (e.g. "27", "64") in the leftmost
+        column.  When row boundaries are placed at the center of whitespace
+        gaps, structures whose content extends near the gap center get
+        truncated.  This method detects the top edge of example number text
+        near each boundary and shifts the boundary upward so the structure
+        above gets maximum downward extent.
+
+        Only activates when >=_REFINE_MIN_CONFIRMED boundaries have detectable
+        ink in the example column strip (tables without example numbers are
+        skipped).
+        """
+        if len(row_bounds) < 4:
+            # Need at least 2 internal boundaries to validate
+            return row_bounds
+
+        # A. Determine example number column region
+        table_w = tx2 - tx1
+        if len(col_bounds) >= 3:
+            ex_x1, ex_x2 = col_bounds[0], col_bounds[1]
+        else:
+            ex_w = min(self._EXAMPLE_COL_MAX_PX,
+                       max(self._EXAMPLE_COL_MIN_PX,
+                           int(table_w * self._EXAMPLE_COL_WIDTH_RATIO)))
+            ex_x1, ex_x2 = tx1, tx1 + ex_w
+
+        if ex_x2 - ex_x1 < 40:
+            return row_bounds
+
+        # B. Validate that example numbers exist — check ink near each
+        #    internal boundary in the example column strip.
+        #    Example numbers are compact text (~15-20px tall).  Reject if
+        #    ink is spread across most of the check window (structure ink).
+        confirmed = 0
+        for i in range(1, len(row_bounds) - 1):
+            b = row_bounds[i]
+            check_y1 = max(ty1, b - 40)
+            check_y2 = min(ty2, b + 40)
+            if check_y2 - check_y1 < 10:
+                continue
+            crop = np.array(
+                page_image.crop((ex_x1, check_y1, ex_x2, check_y2)).convert("L")
+            )
+            dark = crop < self._INK_DARK_THRESHOLD
+            scanline_dens = np.mean(dark, axis=1)
+            ink_lines = int(np.sum(scanline_dens > 0.005))
+            window_h = check_y2 - check_y1
+            # Must have some ink, but it should be compact (< 40% of
+            # the window) — example numbers are ~15-20px, not 50+px.
+            if 3 <= ink_lines <= int(window_h * 0.4):
+                confirmed += 1
+
+        n_internal = len(row_bounds) - 2
+        ratio = confirmed / n_internal if n_internal > 0 else 0
+        if (confirmed < self._REFINE_MIN_CONFIRMED
+                or ratio < self._REFINE_MIN_CONFIRMED_RATIO):
+            logger.debug(
+                "_refine_row_boundaries: skipping — %d/%d (%.0f%%) boundaries "
+                "have compact ink in example column",
+                confirmed, n_internal, ratio * 100,
+            )
+            return row_bounds
+
+        # C. For each internal boundary, find example number ink and shift
+        refined = list(row_bounds)
+        for i in range(1, len(refined) - 1):
+            b = refined[i]
+            search_y1 = max(ty1, b - self._REFINE_SEARCH_ABOVE)
+            search_y2 = min(ty2, b + self._REFINE_SEARCH_BELOW)
+            if search_y2 - search_y1 < 5:
+                continue
+
+            crop = np.array(
+                page_image.crop((ex_x1, search_y1, ex_x2, search_y2)).convert("L")
+            )
+            dark = crop < self._INK_DARK_THRESHOLD
+            scanline_density = np.mean(dark, axis=1)
+
+            # Scan from top downward to find first scanline with ink
+            ink_top_rel = None
+            for j, d in enumerate(scanline_density):
+                if d > 0.005:
+                    ink_top_rel = j
+                    break
+
+            if ink_top_rel is None:
+                continue
+
+            ink_top_abs = search_y1 + ink_top_rel
+            new_boundary = ink_top_abs - self._REFINE_MARGIN_ABOVE_INK
+
+            # Clamp to maintain minimum 20px between boundaries
+            lower_clamp = refined[i - 1] + 20
+            upper_clamp = refined[i + 1] - 20
+            new_boundary = max(lower_clamp, min(upper_clamp, new_boundary))
+
+            if new_boundary != refined[i]:
+                logger.debug(
+                    "_refine_row_boundaries: boundary %d shifted %d → %d (Δ=%d)",
+                    i, refined[i], new_boundary, new_boundary - refined[i],
+                )
+                refined[i] = new_boundary
+
+        return refined
+
     def _detect_table_column_boundaries(
         self, page_image: Image.Image,
         tx1: int, ty1: int, tx2: int, ty2: int,
@@ -579,6 +720,236 @@ class DoclingDetector:
         # Last resort: full table width
         return [(col_boundaries[0], col_boundaries[-1])]
 
+    def _tighten_struct_column_bounds(
+        self,
+        page_image: Image.Image,
+        struct_cols: List[Tuple[int, int]],
+        row_bounds: List[int],
+        tx1: int, ty1: int, tx2: int, ty2: int,
+        col_bounds: List[int],
+        existing_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+    ) -> List[Tuple[int, int]]:
+        """Tighten horizontal bounds by finding vertical ink density gaps.
+
+        When a table has no internal vertical separator lines (col_bounds < 3),
+        struct_cols spans the full table width. This method looks for a clear
+        vertical gap in ink density (e.g. between structure drawings and NMR
+        text or IUPAC names) and narrows the column accordingly.
+        """
+        table_w = tx2 - tx1
+
+        # Guard: columns already detected by line detection
+        if len(col_bounds) >= 3:
+            return struct_cols
+
+        # Guard: multi-column or empty
+        if len(struct_cols) != 1:
+            return struct_cols
+
+        # Guard: already narrow enough (< 60% of table width)
+        sc_left, sc_right = struct_cols[0]
+        if (sc_right - sc_left) < table_w * 0.60:
+            return struct_cols
+
+        # Guard: not enough data rows to sample
+        if len(row_bounds) < 3:
+            return struct_cols
+
+        # Build composite vertical ink density profile across data rows
+        # (skip header row at index 0)
+        profiles = []
+        for r in range(1, len(row_bounds) - 1):
+            ry1 = row_bounds[r]
+            ry2 = row_bounds[r + 1]
+            if ry2 - ry1 < 10:
+                continue
+            row_crop = page_image.crop((tx1, ry1, tx2, ry2)).convert("L")
+            row_arr = np.array(row_crop, dtype=np.float32)
+            # Dark pixel density per column
+            dark = (row_arr < self._INK_DARK_THRESHOLD).astype(np.float32)
+            col_density = dark.mean(axis=0)  # shape: (table_w,)
+            profiles.append(col_density)
+
+        if not profiles:
+            return struct_cols
+
+        # Average across all sampled rows
+        avg_profile = np.mean(profiles, axis=0)
+
+        # Smooth with uniform kernel
+        k = self._TIGHTEN_SMOOTH_KERNEL
+        if len(avg_profile) > k:
+            kernel = np.ones(k) / k
+            avg_profile = np.convolve(avg_profile, kernel, mode="same")
+
+        # --- Right boundary: find leftmost qualifying gap in [30%, 80%] ---
+        search_l = int(table_w * self._TIGHTEN_SEARCH_LEFT)
+        search_r = int(table_w * self._TIGHTEN_SEARCH_RIGHT)
+        new_x2 = sc_right  # default: unchanged
+
+        gap_start = None
+        for i in range(search_l, min(search_r, len(avg_profile))):
+            if avg_profile[i] < self._TIGHTEN_GAP_DENSITY:
+                if gap_start is None:
+                    gap_start = i
+                if i - gap_start + 1 >= self._TIGHTEN_GAP_MIN_WIDTH:
+                    new_x2 = tx1 + gap_start
+                    break
+            else:
+                gap_start = None
+
+        # --- Left boundary: find rightmost qualifying gap in [5%, 25%] ---
+        left_search_l = int(table_w * 0.05)
+        left_search_r = int(table_w * 0.25)
+        new_x1 = sc_left  # default: unchanged
+
+        gap_start = None
+        for i in range(left_search_l, min(left_search_r, len(avg_profile))):
+            if avg_profile[i] < self._TIGHTEN_GAP_DENSITY:
+                if gap_start is None:
+                    gap_start = i
+                gap_end_candidate = i
+            else:
+                if gap_start is not None:
+                    if gap_end_candidate - gap_start + 1 >= self._TIGHTEN_GAP_MIN_WIDTH:
+                        new_x1 = tx1 + gap_end_candidate + 1
+                gap_start = None
+        # Check last run
+        if gap_start is not None:
+            if gap_end_candidate - gap_start + 1 >= self._TIGHTEN_GAP_MIN_WIDTH:
+                new_x1 = tx1 + gap_end_candidate + 1
+
+        # Validate: tightened width must be >= 25% of table width
+        if (new_x2 - new_x1) < table_w * self._TIGHTEN_MIN_RESULT_RATIO:
+            return struct_cols
+
+        # Only return if we actually tightened something
+        if new_x1 == sc_left and new_x2 == sc_right:
+            return struct_cols
+
+        # Validate against existing Docling-detected boxes: if any existing
+        # box extends significantly beyond the proposed tightened bounds,
+        # the structures actually occupy that wider area — don't tighten.
+        if existing_boxes:
+            for bx1, by1, bx2, by2 in existing_boxes:
+                # Check if box center is inside the table
+                bcx = (bx1 + bx2) / 2
+                bcy = (by1 + by2) / 2
+                if not (tx1 <= bcx <= tx2 and ty1 <= bcy <= ty2):
+                    continue
+                # If the box extends 20+ px beyond proposed right bound,
+                # or 20+ px before proposed left bound, abort tightening
+                if bx2 > new_x2 + 20 or bx1 < new_x1 - 20:
+                    logger.debug(
+                        "_tighten_struct_column_bounds: aborted — existing box "
+                        "[%d,%d] extends beyond proposed [%d,%d]",
+                        bx1, bx2, new_x1, new_x2,
+                    )
+                    return struct_cols
+
+        logger.debug(
+            "_tighten_struct_column_bounds: [%d, %d] -> [%d, %d] (table width %d)",
+            sc_left, sc_right, new_x1, new_x2, table_w,
+        )
+        return [(new_x1, new_x2)]
+
+    def _extend_boxes_to_ink(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        page_image: Image.Image,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Extend boxes vertically to capture structure ink beyond boundaries.
+
+        Scans narrow bands above and below each box for dark pixels that
+        continue from the structure content.  Only extends when the band
+        is not already covered by another box.  Limits extension to
+        ``_INK_EXTEND_MAX_PX`` and stops at the first gap of
+        ``_INK_EXTEND_GAP_ROWS`` consecutive empty rows.
+        """
+        if not boxes:
+            return boxes
+
+        gray = np.array(page_image.convert("L"))
+        img_h, img_w = gray.shape
+        max_ext = self._INK_EXTEND_MAX_PX
+        min_den = self._INK_EXTEND_MIN_DENSITY
+        gap_tol = self._INK_EXTEND_GAP_ROWS
+
+        result = list(boxes)
+
+        for i in range(len(result)):
+            x1, y1, x2, y2 = result[i]
+
+            # --- Extend ABOVE ---
+            scan_top = max(0, y1 - max_ext)
+            if scan_top < y1:
+                # Skip if another box already covers this band
+                covered = any(
+                    j != i
+                    and result[j][3] > scan_top  # oy2 > scan_top
+                    and result[j][1] < y1         # oy1 < y1
+                    and result[j][0] < x2         # ox1 < x2
+                    and result[j][2] > x1         # ox2 > x1
+                    for j in range(len(result))
+                )
+                if not covered:
+                    band = gray[scan_top:y1, x1:x2]
+                    dark = (band < self._INK_DARK_THRESHOLD).astype(np.float32)
+                    new_y1 = y1
+                    consecutive_empty = 0
+                    # Scan bottom-to-top (closest to box first)
+                    for row in range(dark.shape[0] - 1, -1, -1):
+                        if dark[row].mean() >= min_den:
+                            new_y1 = scan_top + row
+                            consecutive_empty = 0
+                        else:
+                            consecutive_empty += 1
+                            if consecutive_empty >= gap_tol and new_y1 < y1:
+                                break
+                    if new_y1 < y1:
+                        result[i] = (x1, new_y1, x2, y2)
+                        logger.debug(
+                            "_extend_boxes_to_ink: box %d extended UP by %d px",
+                            i, y1 - new_y1,
+                        )
+
+            # Refresh after possible above-extension
+            x1, y1, x2, y2 = result[i]
+
+            # --- Extend BELOW ---
+            scan_bot = min(img_h, y2 + max_ext)
+            if scan_bot > y2:
+                covered = any(
+                    j != i
+                    and result[j][1] < scan_bot   # oy1 < scan_bot
+                    and result[j][3] > y2          # oy2 > y2
+                    and result[j][0] < x2          # ox1 < x2
+                    and result[j][2] > x1          # ox2 > x1
+                    for j in range(len(result))
+                )
+                if not covered:
+                    band = gray[y2:scan_bot, x1:x2]
+                    dark = (band < self._INK_DARK_THRESHOLD).astype(np.float32)
+                    new_y2 = y2
+                    consecutive_empty = 0
+                    # Scan top-to-bottom (closest to box first)
+                    for row in range(dark.shape[0]):
+                        if dark[row].mean() >= min_den:
+                            new_y2 = y2 + row + 1
+                            consecutive_empty = 0
+                        else:
+                            consecutive_empty += 1
+                            if consecutive_empty >= gap_tol and new_y2 > y2:
+                                break
+                    if new_y2 > y2:
+                        result[i] = (x1, y1, x2, new_y2)
+                        logger.debug(
+                            "_extend_boxes_to_ink: box %d extended DOWN by %d px",
+                            i, new_y2 - y2,
+                        )
+
+        return result
+
     def _fill_table_gaps(
         self,
         boxes: List[Tuple[int, int, int, int]],
@@ -640,10 +1011,23 @@ class DoclingDetector:
                 col_bounds, boxes, inside_idxs,
             )
 
+            # Tighten horizontal bounds via vertical ink density gap detection
+            inside_boxes = [boxes[i] for i in inside_idxs]
+            struct_cols = self._tighten_struct_column_bounds(
+                page_image, struct_cols, row_bounds,
+                tx1, ty1, tx2, ty2, col_bounds,
+                existing_boxes=inside_boxes,
+            )
+
             # Cache structure column X-ranges for cross-page rescue
             self._table_row_cache = struct_cols
             self._template_crop = np.array(
                 page_image.crop(boxes[inside_idxs[0]]).convert("L")
+            )
+
+            # Refine row boundaries by anchoring just above example numbers
+            row_bounds = self._refine_row_boundaries(
+                page_image, row_bounds, tx1, ty1, tx2, ty2, col_bounds,
             )
 
             # Detect oversized boxes: if any inside box covers >80% of the
@@ -668,9 +1052,9 @@ class DoclingDetector:
             data_start = 1 if len(row_bounds) > 2 else 0
 
             for r in range(data_start, len(row_bounds) - 1):
-                cand_y1 = row_bounds[r]
-                cand_y2 = row_bounds[r + 1]
-                row_h = cand_y2 - cand_y1
+                raw_row_h = row_bounds[r + 1] - row_bounds[r]
+                cand_y1 = row_bounds[r] + self._CELL_INWARD_MARGIN_Y
+                cand_y2 = row_bounds[r + 1] - self._CELL_INWARD_MARGIN_Y
                 is_last_row = (r == len(row_bounds) - 2)
 
                 for x_left, x_right in struct_cols:
@@ -681,10 +1065,11 @@ class DoclingDetector:
                         continue
 
                     # Apply relaxed height threshold for last row (Fix 3)
+                    # Use raw row height (before inward margin) for threshold check
                     min_h = self._MIN_STRUCTURE_ROW_HEIGHT
-                    if is_last_row and row_h >= 100:
+                    if is_last_row and raw_row_h >= 100:
                         min_h = 100
-                    if row_h < min_h:
+                    if raw_row_h < min_h:
                         continue
 
                     # Check if any existing box already covers this cell
@@ -871,15 +1256,20 @@ class DoclingDetector:
             # Cache structure column X-ranges for subsequent pages
             self._table_row_cache = struct_cols
 
+            # Refine row boundaries by anchoring just above example numbers
+            row_bounds = self._refine_row_boundaries(
+                page_image, row_bounds, tx1, ty1, tx2, ty2, col_bounds,
+            )
+
             # Skip the header row
             data_start = 1 if len(row_bounds) > 2 else 0
 
             # Collect candidates from all structure columns
             table_candidates = []
             for r in range(data_start, len(row_bounds) - 1):
-                cand_y1 = row_bounds[r]
-                cand_y2 = row_bounds[r + 1]
-                row_h = cand_y2 - cand_y1
+                raw_row_h = row_bounds[r + 1] - row_bounds[r]
+                cand_y1 = row_bounds[r] + self._CELL_INWARD_MARGIN_Y
+                cand_y2 = row_bounds[r + 1] - self._CELL_INWARD_MARGIN_Y
                 is_last_row = (r == len(row_bounds) - 2)
 
                 for x_left, x_right in struct_cols:
@@ -890,10 +1280,11 @@ class DoclingDetector:
                         continue
 
                     # Apply relaxed height threshold for last row (Fix 3)
+                    # Use raw row height (before inward margin) for threshold check
                     min_h = self._MIN_STRUCTURE_ROW_HEIGHT
-                    if is_last_row and row_h >= 100:
+                    if is_last_row and raw_row_h >= 100:
                         min_h = 100
-                    if row_h < min_h:
+                    if raw_row_h < min_h:
                         continue
 
                     # Check not already covered
@@ -969,7 +1360,7 @@ class DoclingDetector:
             # Sort by y1
             inside.sort(key=lambda i: result[i][1])
 
-            # For each consecutive pair, close the gap
+            # For each consecutive pair, close the gap (upward)
             for k in range(1, len(inside)):
                 prev_idx = inside[k - 1]
                 curr_idx = inside[k]
@@ -979,6 +1370,17 @@ class DoclingDetector:
 
                 if 0 < gap < 80:  # small gap likely containing example number
                     result[curr_idx] = (curr_x1, prev_y2, curr_x2, curr_y2)
+
+            # Also extend boxes downward to close gaps below
+            for k in range(len(inside) - 1):
+                curr_idx = inside[k]
+                next_idx = inside[k + 1]
+                curr_x1, curr_y1, curr_x2, curr_y2 = result[curr_idx]
+                next_y1 = result[next_idx][1]
+                gap = next_y1 - curr_y2
+
+                if 0 < gap < 80:
+                    result[curr_idx] = (curr_x1, curr_y1, curr_x2, next_y1)
 
         return result
 
@@ -1288,8 +1690,8 @@ class DoclingDetector:
         # Don't skip first row — the grid box typically starts below headers
 
         for r in range(len(row_bounds) - 1):
-            ry1 = row_bounds[r]
-            ry2 = row_bounds[r + 1]
+            ry1 = row_bounds[r] + self._CELL_INWARD_MARGIN_Y
+            ry2 = row_bounds[r + 1] - self._CELL_INWARD_MARGIN_Y
             if ry2 - ry1 < 100:
                 continue
 

@@ -105,15 +105,20 @@ def run_patent(patent_cfg, page_filter=None):
         }
         results.append(result)
 
-        # Save annotated image
-        annotated = pil_image.copy()
+        # Save annotated image with semi-transparent fills to show overlap
+        annotated = pil_image.copy().convert("RGBA")
+        overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
         draw = ImageDraw.Draw(annotated)
         for i, (crop_img, box) in enumerate(detections):
             x1, y1, x2, y2 = box
             color = (0, 200, 0) if delta == 0 else (255, 0, 0)
+            fill_color = color + (30,)  # semi-transparent fill
+            overlay_draw.rectangle(box, fill=fill_color)
             draw.rectangle(box, outline=color, width=3)
             label = f"[{i}] {x2-x1}x{y2-y1}"
             draw.text((x1 + 4, y1 + 4), label, fill=color)
+        annotated = Image.alpha_composite(annotated, overlay).convert("RGB")
 
         # Add status bar at top
         status_color = (0, 180, 0) if delta == 0 else (220, 0, 0)

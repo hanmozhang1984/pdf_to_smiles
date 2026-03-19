@@ -69,17 +69,23 @@ class DoclingDetector:
     _EXAMPLE_COL_MAX_PX = 150         # maximum example column width (px)
 
     # Tighten horizontal bounds via vertical ink density gap detection
-    _TIGHTEN_GAP_DENSITY = 0.005       # max density to qualify as a vertical gap
-    _TIGHTEN_GAP_MIN_WIDTH = 15        # min gap width in pixels
+    _TIGHTEN_GAP_DENSITY = 0.006       # max density to qualify as a vertical gap
+    _TIGHTEN_GAP_MIN_WIDTH = 8         # min gap width in pixels
     _TIGHTEN_SEARCH_LEFT = 0.30        # right-gap search starts at 30% of table width
     _TIGHTEN_SEARCH_RIGHT = 0.80       # right-gap search ends at 80% of table width
     _TIGHTEN_MIN_RESULT_RATIO = 0.25   # tightened column must be >= 25% of table width
     _TIGHTEN_SMOOTH_KERNEL = 21        # smoothing kernel width for density profile
 
     # Ink extension — extend boxes vertically to capture truncated structure elements
-    _INK_EXTEND_MAX_PX = 60            # max pixels to scan beyond box edge
+    _INK_EXTEND_MAX_PX = 120           # max pixels to scan beyond box edge
     _INK_EXTEND_MIN_DENSITY = 0.008    # min ink density in a row to count as content
-    _INK_EXTEND_GAP_ROWS = 5          # consecutive empty rows to stop extending
+    _INK_EXTEND_GAP_ROWS = 8          # consecutive empty rows to stop extending
+
+    # Connected component expansion — capture peripheral groups via ink connectivity
+    _CC_EXPAND_SEARCH_PAD = 40         # px to pad search region beyond box
+    _CC_EXPAND_CLOSE_KERNEL = 7        # morphological closing kernel (bridges ~5px gaps)
+    _CC_EXPAND_MAX_PER_SIDE = 60       # max expansion per direction (px)
+    _CC_EXPAND_MIN_COMPONENT = 50      # min component area (px) to consider
 
     # Keywords for table caption/header scanning.  "structure" is the primary
     # trigger; "compound" / "cpd" are secondary (guarded by validation).
@@ -123,6 +129,7 @@ class DoclingDetector:
         boxes = self._fill_column_gaps(boxes, page_image, page_num)
         boxes = self._split_compound_boxes(boxes, page_image, page_num)
         boxes = self._extend_boxes_to_ink(boxes, page_image)
+        boxes = self._expand_boxes_by_connectivity(boxes, page_image)
         if not boxes:
             return []
 
@@ -828,24 +835,26 @@ class DoclingDetector:
             return struct_cols
 
         # Validate against existing Docling-detected boxes: if any existing
-        # box extends significantly beyond the proposed tightened bounds,
-        # the structures actually occupy that wider area — don't tighten.
+        # box extends significantly beyond a proposed tightened bound,
+        # revert that individual bound (the structures occupy that area).
         if existing_boxes:
             for bx1, by1, bx2, by2 in existing_boxes:
-                # Check if box center is inside the table
                 bcx = (bx1 + bx2) / 2
                 bcy = (by1 + by2) / 2
                 if not (tx1 <= bcx <= tx2 and ty1 <= bcy <= ty2):
                     continue
-                # If the box extends 20+ px beyond proposed right bound,
-                # or 20+ px before proposed left bound, abort tightening
-                if bx2 > new_x2 + 20 or bx1 < new_x1 - 20:
+                if bx2 > new_x2 + 20:
                     logger.debug(
-                        "_tighten_struct_column_bounds: aborted — existing box "
-                        "[%d,%d] extends beyond proposed [%d,%d]",
-                        bx1, bx2, new_x1, new_x2,
+                        "_tighten_struct_column_bounds: reverting right — box x2=%d > proposed %d",
+                        bx2, new_x2,
                     )
-                    return struct_cols
+                    new_x2 = sc_right
+                if bx1 < new_x1 - 20:
+                    logger.debug(
+                        "_tighten_struct_column_bounds: reverting left — box x1=%d < proposed %d",
+                        bx1, new_x1,
+                    )
+                    new_x1 = sc_left
 
         logger.debug(
             "_tighten_struct_column_bounds: [%d, %d] -> [%d, %d] (table width %d)",
@@ -880,38 +889,40 @@ class DoclingDetector:
         for i in range(len(result)):
             x1, y1, x2, y2 = result[i]
 
+            # Narrow the X scan range to where ink actually exists inside
+            # the box.  Wide table-fill boxes dilute the density when the
+            # structure only occupies part of the width.
+            box_region = gray[y1:y2, x1:x2]
+            col_dark = (box_region < self._INK_DARK_THRESHOLD).mean(axis=0)
+            ink_cols = np.where(col_dark > 0.005)[0]
+            if len(ink_cols) > 2:
+                sx1 = x1 + int(ink_cols[0])
+                sx2 = x1 + int(ink_cols[-1]) + 1
+            else:
+                sx1, sx2 = x1, x2
+
             # --- Extend ABOVE ---
             scan_top = max(0, y1 - max_ext)
             if scan_top < y1:
-                # Skip if another box already covers this band
-                covered = any(
-                    j != i
-                    and result[j][3] > scan_top  # oy2 > scan_top
-                    and result[j][1] < y1         # oy1 < y1
-                    and result[j][0] < x2         # ox1 < x2
-                    and result[j][2] > x1         # ox2 > x1
-                    for j in range(len(result))
-                )
-                if not covered:
-                    band = gray[scan_top:y1, x1:x2]
-                    dark = (band < self._INK_DARK_THRESHOLD).astype(np.float32)
-                    new_y1 = y1
-                    consecutive_empty = 0
-                    # Scan bottom-to-top (closest to box first)
-                    for row in range(dark.shape[0] - 1, -1, -1):
-                        if dark[row].mean() >= min_den:
-                            new_y1 = scan_top + row
-                            consecutive_empty = 0
-                        else:
-                            consecutive_empty += 1
-                            if consecutive_empty >= gap_tol and new_y1 < y1:
-                                break
-                    if new_y1 < y1:
-                        result[i] = (x1, new_y1, x2, y2)
-                        logger.debug(
-                            "_extend_boxes_to_ink: box %d extended UP by %d px",
-                            i, y1 - new_y1,
-                        )
+                band = gray[scan_top:y1, sx1:sx2]
+                dark = (band < self._INK_DARK_THRESHOLD).astype(np.float32)
+                new_y1 = y1
+                consecutive_empty = 0
+                # Scan bottom-to-top (closest to box first)
+                for row in range(dark.shape[0] - 1, -1, -1):
+                    if dark[row].mean() >= min_den:
+                        new_y1 = scan_top + row
+                        consecutive_empty = 0
+                    else:
+                        consecutive_empty += 1
+                        if consecutive_empty >= gap_tol and new_y1 < y1:
+                            break
+                if new_y1 < y1:
+                    result[i] = (x1, new_y1, x2, y2)
+                    logger.debug(
+                        "_extend_boxes_to_ink: box %d extended UP by %d px",
+                        i, y1 - new_y1,
+                    )
 
             # Refresh after possible above-extension
             x1, y1, x2, y2 = result[i]
@@ -919,34 +930,164 @@ class DoclingDetector:
             # --- Extend BELOW ---
             scan_bot = min(img_h, y2 + max_ext)
             if scan_bot > y2:
-                covered = any(
-                    j != i
-                    and result[j][1] < scan_bot   # oy1 < scan_bot
-                    and result[j][3] > y2          # oy2 > y2
-                    and result[j][0] < x2          # ox1 < x2
-                    and result[j][2] > x1          # ox2 > x1
-                    for j in range(len(result))
+                band = gray[y2:scan_bot, sx1:sx2]
+                dark = (band < self._INK_DARK_THRESHOLD).astype(np.float32)
+                new_y2 = y2
+                consecutive_empty = 0
+                # Scan top-to-bottom (closest to box first)
+                for row in range(dark.shape[0]):
+                    if dark[row].mean() >= min_den:
+                        new_y2 = y2 + row + 1
+                        consecutive_empty = 0
+                    else:
+                        consecutive_empty += 1
+                        if consecutive_empty >= gap_tol and new_y2 > y2:
+                            break
+                if new_y2 > y2:
+                    result[i] = (x1, y1, x2, new_y2)
+                    logger.debug(
+                        "_extend_boxes_to_ink: box %d extended DOWN by %d px",
+                        i, new_y2 - y2,
+                    )
+
+        return result
+
+    def _expand_boxes_by_connectivity(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        page_image: Image.Image,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Expand boxes to include ink blobs connected to box content.
+
+        After ink-density extension, peripheral functional groups (e.g.
+        isopropyl H3C/CH3, methoxyethyl chains) may still be clipped
+        because their ink is sparse relative to box width.  This method
+        uses morphological closing + connected component analysis to find
+        ink regions physically connected to each box's content and expands
+        the box to encompass them.
+        """
+        if not boxes:
+            return boxes
+
+        gray = np.array(page_image.convert("L"))
+        img_h, img_w = gray.shape
+        pad = self._CC_EXPAND_SEARCH_PAD
+        max_exp = self._CC_EXPAND_MAX_PER_SIDE
+        min_area = self._CC_EXPAND_MIN_COMPONENT
+        k_size = self._CC_EXPAND_CLOSE_KERNEL
+
+        # Precompute center points of all boxes for collision guard
+        centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
+
+        result = list(boxes)
+
+        for i in range(len(result)):
+            x1, y1, x2, y2 = result[i]
+
+            # 1. Search region: pad box, clamp to image bounds
+            sx1 = max(0, x1 - pad)
+            sy1 = max(0, y1 - pad)
+            sx2 = min(img_w, x2 + pad)
+            sy2 = min(img_h, y2 + pad)
+
+            # 2. Binarize search region
+            region = gray[sy1:sy2, sx1:sx2]
+            binary = (region < self._INK_DARK_THRESHOLD).astype(np.uint8) * 255
+
+            # 3. Morphological closing to bridge bond-to-label gaps
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (k_size, k_size),
+            )
+            closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+            # 4. Connected components
+            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                closed, connectivity=8,
+            )
+
+            # 5. Find components overlapping the original box region
+            # Box coordinates in search-region space
+            bx1_local = x1 - sx1
+            by1_local = y1 - sy1
+            bx2_local = x2 - sx1
+            by2_local = y2 - sy1
+
+            # Create mask of the box region in search-region coords
+            box_mask = np.zeros(labels.shape, dtype=bool)
+            box_mask[by1_local:by2_local, bx1_local:bx2_local] = True
+
+            # Find labels that overlap the box
+            overlapping_labels = set(np.unique(labels[box_mask])) - {0}
+
+            # 6. Build expanded bounds from qualifying components
+            exp_x1, exp_y1, exp_x2, exp_y2 = x1, y1, x2, y2
+            found_expansion = False
+
+            for lbl in range(1, n_labels):
+                if lbl not in overlapping_labels:
+                    continue
+                area = int(stats[lbl, cv2.CC_STAT_AREA])
+                if area < min_area:
+                    continue
+
+                # Component bounding rect in search-region coords
+                cx = int(stats[lbl, cv2.CC_STAT_LEFT])
+                cy = int(stats[lbl, cv2.CC_STAT_TOP])
+                cw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+                ch = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+
+                # Convert to image coords
+                comp_x1 = sx1 + cx
+                comp_y1 = sy1 + cy
+                comp_x2 = sx1 + cx + cw
+                comp_y2 = sy1 + cy + ch
+
+                exp_x1 = min(exp_x1, comp_x1)
+                exp_y1 = min(exp_y1, comp_y1)
+                exp_x2 = max(exp_x2, comp_x2)
+                exp_y2 = max(exp_y2, comp_y2)
+                found_expansion = True
+
+            if not found_expansion:
+                continue
+
+            # 7. Cap expansion per direction
+            exp_x1 = max(exp_x1, x1 - max_exp)
+            exp_y1 = max(exp_y1, y1 - max_exp)
+            exp_x2 = min(exp_x2, x2 + max_exp)
+            exp_y2 = min(exp_y2, y2 + max_exp)
+
+            # Clamp to image bounds
+            exp_x1 = max(0, exp_x1)
+            exp_y1 = max(0, exp_y1)
+            exp_x2 = min(img_w, exp_x2)
+            exp_y2 = min(img_h, exp_y2)
+
+            # 8. Collision guard: revert expansion in any direction if it
+            # would encompass another box's center
+            for j, (cx, cy) in enumerate(centers):
+                if j == i:
+                    continue
+                # Check if the other box's center falls inside the expanded box
+                if exp_x1 <= cx <= exp_x2 and exp_y1 <= cy <= exp_y2:
+                    # Revert the direction(s) that caused the collision
+                    ox1, oy1, ox2, oy2 = result[i]
+                    if cx < ox1:  # other center is to the left
+                        exp_x1 = ox1
+                    if cx > ox2:  # other center is to the right
+                        exp_x2 = ox2
+                    if cy < oy1:  # other center is above
+                        exp_y1 = oy1
+                    if cy > oy2:  # other center is below
+                        exp_y2 = oy2
+
+            if (exp_x1, exp_y1, exp_x2, exp_y2) != (x1, y1, x2, y2):
+                logger.debug(
+                    "_expand_boxes_by_connectivity: box %d expanded "
+                    "(%d,%d,%d,%d) → (%d,%d,%d,%d)",
+                    i, x1, y1, x2, y2, exp_x1, exp_y1, exp_x2, exp_y2,
                 )
-                if not covered:
-                    band = gray[y2:scan_bot, x1:x2]
-                    dark = (band < self._INK_DARK_THRESHOLD).astype(np.float32)
-                    new_y2 = y2
-                    consecutive_empty = 0
-                    # Scan top-to-bottom (closest to box first)
-                    for row in range(dark.shape[0]):
-                        if dark[row].mean() >= min_den:
-                            new_y2 = y2 + row + 1
-                            consecutive_empty = 0
-                        else:
-                            consecutive_empty += 1
-                            if consecutive_empty >= gap_tol and new_y2 > y2:
-                                break
-                    if new_y2 > y2:
-                        result[i] = (x1, y1, x2, new_y2)
-                        logger.debug(
-                            "_extend_boxes_to_ink: box %d extended DOWN by %d px",
-                            i, new_y2 - y2,
-                        )
+                result[i] = (exp_x1, exp_y1, exp_x2, exp_y2)
 
         return result
 
@@ -1248,10 +1389,21 @@ class DoclingDetector:
                 col_bounds, boxes, [],
             )
 
-            # If no cache yet and few columns, use full table width with margins
-            if self._table_row_cache is None and len(col_bounds) < 3:
-                margin = int((tx2 - tx1) * 0.05)
-                struct_cols = [(tx1 + margin, tx2 - margin)]
+            # When few vertical separator lines exist (col_bounds < 3),
+            # struct_cols is the full table width. Use cached tightened
+            # bounds if genuinely narrower; apply margin fallback only
+            # when no cache exists (preserving baseline behavior).
+            if len(col_bounds) < 3:
+                table_w = tx2 - tx1
+                if self._table_row_cache is not None and len(self._table_row_cache) == 1:
+                    c_left, c_right = self._table_row_cache[0]
+                    cache_w = c_right - c_left
+                    # Use cache if genuinely narrower (< 80% of table) and fits
+                    if cache_w < table_w * 0.80 and c_left >= tx1 and c_right <= tx2:
+                        struct_cols = list(self._table_row_cache)
+                elif self._table_row_cache is None:
+                    margin = int(table_w * 0.05)
+                    struct_cols = [(tx1 + margin, tx2 - margin)]
 
             # Cache structure column X-ranges for subsequent pages
             self._table_row_cache = struct_cols

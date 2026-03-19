@@ -9,6 +9,8 @@ Improvements over raw MolSight:
 2. SCF3 post-processing — fix known invalid sulfur valence patterns
 3. Multi-variant retry — CLAHE / adaptive threshold on failure
 4. MolScribe fallback — try MolScribe when MolSight returns invalid SMILES
+5. Deuterium wildcard repair — fix * atoms from D₃C / [2H] labels
+6. Stereodescriptor masking — remove (R), (S) text that confuses the model
 """
 
 from __future__ import annotations
@@ -24,6 +26,35 @@ from PIL import Image
 from .subprocess_predictor import SubprocessPredictor
 
 logger = logging.getLogger(__name__)
+
+
+def _keep_largest_fragment(smiles: str) -> str:
+    """Keep only the largest fragment from a dot-separated SMILES.
+
+    When crops include ink from adjacent table rows (e.g. an isopropyl
+    group bleeding in from the row above), MolSight reads them as a
+    separate molecule joined by '.'.  The real structure is always the
+    longest fragment; the contamination is short (10-20 chars).
+
+    Only strips fragments when the length ratio is >=3:1 to avoid
+    discarding legitimate salts/counterions of similar size.
+    """
+    if not smiles or '.' not in smiles:
+        return smiles
+
+    fragments = smiles.split('.')
+    if len(fragments) < 2:
+        return smiles
+
+    longest = max(fragments, key=len)
+    second = max((f for f in fragments if f is not longest), key=len, default='')
+
+    # Only strip if the longest fragment is >=3x the second-longest,
+    # so we don't discard genuine counterions (e.g. CF3COOH salts)
+    if len(longest) >= 3 * max(len(second), 1):
+        return longest
+
+    return smiles
 
 
 def _fix_sulfur_valence(smiles: str) -> str:
@@ -74,6 +105,148 @@ def _fix_sulfur_valence(smiles: str) -> str:
         pass
 
     return smiles  # Revert if fix produces invalid SMILES
+
+
+def _fix_deuterium_wildcards(smiles: str) -> str:
+    """Replace wildcard atoms (*) that likely represent deuterium labels.
+
+    MolSight reads D₃C (trideuteromethyl) and similar deuterium labels
+    as * (wildcard) because [2H] is absent from its training vocabulary.
+
+    Tries CD3 replacement first; if that produces an invalid SMILES
+    (e.g., multiple wildcards cause valence issues), tries replacing
+    wildcards one at a time.
+
+    Only applies when the result is a valid SMILES with more atoms.
+    """
+    if not smiles or '*' not in smiles:
+        return smiles
+
+    from rdkit import Chem
+
+    cd3 = '[2H]C([2H])([2H])'
+
+    # Try replacing all wildcards at once
+    modified = smiles.replace('*', cd3)
+    try:
+        new_mol = Chem.MolFromSmiles(modified)
+        if new_mol is not None and new_mol.GetNumAtoms() >= 3:
+            return Chem.CanonSmiles(modified)
+    except Exception:
+        pass
+
+    # If bulk replacement failed, try one wildcard at a time
+    # (some multi-wildcard SMILES only work with partial replacement)
+    best = smiles
+    current = smiles
+    for _ in range(smiles.count('*')):
+        candidate = current.replace('*', cd3, 1)
+        try:
+            mol = Chem.MolFromSmiles(candidate)
+            if mol is not None and mol.GetNumAtoms() >= 3:
+                best = Chem.CanonSmiles(candidate)
+                current = candidate
+            else:
+                break
+        except Exception:
+            break
+
+    return best
+
+
+def _mask_stereodescriptors(image: Image.Image) -> Image.Image:
+    """Mask italic (R), (S), (E), (Z) stereodescriptor text labels.
+
+    Patent structure images often include italic stereodescriptor labels
+    like (R), (S) next to stereocenters. These confuse MolSight into
+    misreading or truncating adjacent structural features.
+
+    Strategy: find small clusters of ink pixels that match the size and
+    density profile of stereodescriptor labels, then white-fill them.
+    Uses morphological closing to merge nearby letter components (e.g.,
+    "(", "R", ")") into single blobs before size-filtering.
+    """
+    import cv2
+    import numpy as np
+
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+
+    img = np.array(image)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+
+    # Threshold to find ink
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Close small gaps to merge "(", "R", ")" into single blobs.
+    # A 5x3 kernel bridges horizontal gaps typical of italic text spacing.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    # Find connected components on closed image
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        closed, connectivity=8
+    )
+
+    result = img.copy()
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    # Stereodescriptor label: "(R)" or "(S)" is typically 15-45px wide, 8-20px tall
+    min_cw, max_cw = 8, int(w * 0.14)
+    min_ch, max_ch = 6, int(h * 0.10)
+
+    for i in range(1, num_labels):  # skip background
+        cx = stats[i, cv2.CC_STAT_LEFT]
+        cy = stats[i, cv2.CC_STAT_TOP]
+        cw = stats[i, cv2.CC_STAT_WIDTH]
+        ch = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+
+        if not (min_cw <= cw <= max_cw and min_ch <= ch <= max_ch):
+            continue
+
+        # Aspect ratio: wider than tall (text-like), but not extremely elongated
+        aspect = cw / max(ch, 1)
+        if not (0.6 <= aspect <= 3.5):
+            continue
+
+        # Fill ratio of the closed blob
+        fill = area / max(cw * ch, 1)
+        if not (0.20 <= fill <= 0.85):
+            continue
+
+        # Check the original (non-closed) binary for the actual ink in this region.
+        # Stereodescriptors have multiple sub-components: "(", letter, ")"
+        roi = binary[cy:cy+ch, cx:cx+cw]
+        roi_nlabels = cv2.connectedComponents(roi, connectivity=8)[0]
+        # "(R)" typically has 3-5 original components: "(", "R", ")", and any
+        # serifs. Single solid blobs (atoms, bonds) have 1-2.
+        if roi_nlabels < 3:
+            continue
+
+        # Ink density in original ROI (stereodescriptors are moderately dense text)
+        orig_fill = cv2.countNonZero(roi) / max(cw * ch, 1)
+        if orig_fill < 0.08 or orig_fill > 0.60:
+            continue
+
+        # Mark for masking
+        pad = 2
+        y0 = max(cy - pad, 0)
+        y1 = min(cy + ch + pad, h)
+        x0 = max(cx - pad, 0)
+        x1 = min(cx + cw + pad, w)
+        mask[y0:y1, x0:x1] = 255
+
+    # Safety: don't mask if we'd remove too much ink (>15%)
+    total_ink = cv2.countNonZero(binary)
+    masked_ink = cv2.countNonZero(binary & mask)
+    if total_ink > 0 and masked_ink / total_ink > 0.15:
+        return image
+
+    # Apply mask
+    result[mask > 0] = 255
+    return Image.fromarray(result)
 
 
 def _is_valid_smiles(smiles: str) -> bool:
@@ -314,7 +487,20 @@ class MolSightPredictor(SubprocessPredictor):
             else:
                 if best_disconnected is None:
                     best_disconnected = s
-        return best_connected or best_disconnected
+        if best_connected:
+            return best_connected
+        if best_disconnected:
+            return _keep_largest_fragment(best_disconnected)
+        return None
+
+    @staticmethod
+    def _postprocess(smiles: Optional[str]) -> Optional[str]:
+        """Apply all SMILES post-processing fixes."""
+        if not smiles:
+            return smiles
+        smiles = _fix_sulfur_valence(smiles)
+        smiles = _fix_deuterium_wildcards(smiles)
+        return smiles
 
     def predict(
         self,
@@ -329,13 +515,13 @@ class MolSightPredictor(SubprocessPredictor):
         3. CLAHE-enhanced cleaned image → MolSight
         4. If all MolSight attempts failed → MolScribe fallback
 
-        At each step, apply SCF3 post-processing and prefer connected SMILES.
+        At each step, apply SCF3 + deuterium post-processing and prefer
+        connected SMILES.
         """
         molsight_results: list[Optional[str]] = []
 
         # Step 1: Raw image — MolSight's internal transforms handle it best
-        result = self.predict_single(image)
-        result = _fix_sulfur_valence(result) if result else result
+        result = self._postprocess(self.predict_single(image))
         molsight_results.append(result)
 
         # Early return if we got a valid connected SMILES
@@ -344,8 +530,7 @@ class MolSightPredictor(SubprocessPredictor):
 
         # Step 2: Cleaned image (remove bleeding lines, mask text)
         cleaned = self._preprocess(image)
-        result = self.predict_single(cleaned)
-        result = _fix_sulfur_valence(result) if result else result
+        result = self._postprocess(self.predict_single(cleaned))
         molsight_results.append(result)
 
         if result and _is_valid_smiles(result) and '.' not in result:
@@ -353,8 +538,7 @@ class MolSightPredictor(SubprocessPredictor):
 
         # Step 3: CLAHE enhancement on cleaned image
         enhanced = self._enhance_image(cleaned, aggressive=False)
-        result = self.predict_single(enhanced)
-        result = _fix_sulfur_valence(result) if result else result
+        result = self._postprocess(self.predict_single(enhanced))
         molsight_results.append(result)
 
         # Check if any MolSight variant gave a usable result

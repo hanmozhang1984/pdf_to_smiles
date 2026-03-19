@@ -77,6 +77,11 @@ _EXAMPLES_PATTERNS = [
     re.compile(r'^\s*EXPERIMENTAL\s*$', re.MULTILINE),
     # Compound headers: "SPECIFIC EXAMPLES", "SYNTHESIS OF EXAMPLES", etc.
     re.compile(r'^\s*(?:SPECIFIC|SYNTHESIS\s+OF|PREPARATIVE)\s+EXAMPLES?\s*$', re.MULTILINE),
+    # "Non-Limiting Exemplary Compounds", "Exemplary Compounds", etc.
+    re.compile(
+        r'^\s*(?:NON[- ]LIMITING\s+)?EXEMPLARY\s+COMPOUNDS?\s*$',
+        re.MULTILINE | re.IGNORECASE,
+    ),
     # "Example 1:" or "Example 1." as a heading (not inline reference)
     # Must appear at/near start of line, not buried in a paragraph
     re.compile(r'^\s*Example\s+1\s*[:.]\s*', re.MULTILINE),
@@ -123,6 +128,21 @@ def _is_examples_section_start(text: str, match: re.Match) -> bool:
     Returns:
         True if this appears to be the real Examples section start.
     """
+    matched_text = match.group().strip()
+
+    # Specific patterns like "Synthesis of Example 1" or "Example 1:" are
+    # inherently reliable — these only appear in the actual Examples section
+    if re.search(r'(?:Synthesis|Preparation)\s+of\s+Example', matched_text, re.IGNORECASE):
+        return True
+    if re.search(r'Example\s+1\s*[:.]\s*', matched_text):
+        return True
+    if re.search(r'EXAMPLE\s+1\b', matched_text):
+        return True
+    if re.search(r'EXEMPLARY\s+COMPOUNDS?', matched_text, re.IGNORECASE):
+        return True
+
+    # For generic "EXAMPLES" headers, check context to filter out
+    # description-section forward references
     pos = match.start()
     # Get ~500 chars after the match for context
     context_after = text[pos:pos + 500]

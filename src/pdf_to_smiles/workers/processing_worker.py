@@ -495,7 +495,80 @@ class ProcessingWorker(QThread):
                         results.append(result)
                         self.result_ready.emit(result)
 
-                    self._pages_processed += 1
+                            self._emit_progress(
+                                page_num, total_pages, struct_idx + 1, total_structures,
+                                f"File {file_num}/{total_files}: Page {page_num}, structure {struct_idx + 1}/{total_structures}"
+                            )
+
+                            try:
+                                smiles = None
+
+                                # For scheme-sized crops, try VLM extraction first
+                                if struct_idx < len(structure_boxes):
+                                    box = structure_boxes[struct_idx]
+                                    if box is not None:
+                                        from ..core.vlm_scheme_extractor import (
+                                            is_scheme_crop,
+                                            is_available as _vlm_available,
+                                            extract_final_product_smiles,
+                                        )
+                                        pw, ph = page_image.size
+                                        if is_scheme_crop(box, pw, ph) and _vlm_available():
+                                            logger.info(
+                                                "Page %d struct %d: large crop (%dx%d on %dx%d page), "
+                                                "trying VLM scheme extraction",
+                                                page_num, struct_idx,
+                                                box[2] - box[0], box[3] - box[1], pw, ph,
+                                            )
+                                            vlm_smiles = extract_final_product_smiles(struct_image)
+                                            if vlm_smiles:
+                                                is_valid, canonical, _ = \
+                                                    self._smiles_validator.validate_and_render(vlm_smiles)
+                                                if is_valid:
+                                                    smiles = canonical or vlm_smiles
+                                                    logger.info(
+                                                        "VLM scheme extraction succeeded: %s",
+                                                        smiles[:80],
+                                                    )
+
+                                # Regular prediction (skip if VLM already succeeded)
+                                if smiles is None:
+                                    smiles = self._inference_provider.predict_smiles(
+                                        struct_image, high_accuracy=self._high_accuracy_mode
+                                    )
+                                result.smiles = smiles
+
+                                if smiles:
+                                    # Validate and render
+                                    is_valid, canonical, rdkit_img = \
+                                        self._smiles_validator.validate_and_render(smiles)
+                                    result.is_valid = is_valid
+                                    result.canonical_smiles = canonical
+                                    result.rdkit_image = rdkit_img
+
+                                    # Calculate physicochemical properties for valid SMILES
+                                    if is_valid:
+                                        props = self._smiles_validator.get_all_properties(
+                                            canonical or smiles
+                                        )
+                                        result.molecular_weight = props['molecular_weight']
+                                        result.molecular_formula = props['molecular_formula']
+                                        result.clogp = props['clogp']
+                                        result.tpsa = props['tpsa']
+                                        result.num_rotatable_bonds = props['num_rotatable_bonds']
+                                        result.num_stereocenters = props['num_stereocenters']
+                                else:
+                                    result.error_message = "SMILES prediction failed"
+
+                            except Exception as e:
+                                result.error_message = str(e)
+
+                            results.append(result)
+                            self.result_ready.emit(result)
+
+                        self._pages_processed += 1
+
+                    batch_start = batch_end
 
                 # Extract biological data from the entire PDF
                 if not self._is_cancelled():

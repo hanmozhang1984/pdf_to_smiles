@@ -1,0 +1,26 @@
+{
+  "total_train": 1674,
+  "total_val": 109,
+  "sources": {
+    "bridged_bicyclic": {
+      "total_rows": 280,
+      "unique_smiles": 28
+    },
+    "diverse_heterocycle": {
+      "total_rows": 93,
+      "unique_smiles": 31
+    },
+    "hard_example": {
+      "total_rows": 155,
+      "unique_smiles": 31
+    },
+    "macrocycle": {
+      "total_rows": 150,
+      "unique_smiles": 15
+    },
+    "patent": {
+      "total_rows": 996,
+      "unique_smiles": 973
+    }
+  }
+}

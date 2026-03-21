@@ -87,6 +87,10 @@ class DoclingDetector:
     _CC_EXPAND_MAX_PER_SIDE = 60       # max expansion per direction (px)
     _CC_EXPAND_MIN_COMPONENT = 50      # min component area (px) to consider
 
+    # Grid columns narrower than this fraction of the full box width are
+    # assumed to be label/number columns and skipped during decomposition.
+    _GRID_MIN_COL_WIDTH_FRAC = 0.30
+
     # Keywords for table caption/header scanning.  "structure" is the primary
     # trigger; "compound" / "cpd" are secondary (guarded by validation).
     # Avoid "example" alone — it matches numeric data tables (TABLE 19 etc.).
@@ -727,6 +731,20 @@ class DoclingDetector:
         # Last resort: full table width
         return [(col_boundaries[0], col_boundaries[-1])]
 
+    def _filter_narrow_columns(
+        self,
+        struct_cols: List[Tuple[int, int]],
+        table_width: int,
+    ) -> List[Tuple[int, int]]:
+        """Remove columns narrower than 30% of total width (label/number columns)."""
+        if len(struct_cols) <= 1:
+            return struct_cols
+        filtered = [
+            (xl, xr) for xl, xr in struct_cols
+            if (xr - xl) / max(table_width, 1) >= self._GRID_MIN_COL_WIDTH_FRAC
+        ]
+        return filtered if filtered else struct_cols  # keep at least one
+
     def _tighten_struct_column_bounds(
         self,
         page_image: Image.Image,
@@ -1151,6 +1169,7 @@ class DoclingDetector:
             struct_cols = self._identify_structure_columns(
                 col_bounds, boxes, inside_idxs,
             )
+            struct_cols = self._filter_narrow_columns(struct_cols, tx2 - tx1)
 
             # Tighten horizontal bounds via vertical ink density gap detection
             inside_boxes = [boxes[i] for i in inside_idxs]
@@ -1388,6 +1407,7 @@ class DoclingDetector:
             struct_cols = self._identify_structure_columns(
                 col_bounds, boxes, [],
             )
+            struct_cols = self._filter_narrow_columns(struct_cols, tx2 - tx1)
 
             # When few vertical separator lines exist (col_bounds < 3),
             # struct_cols is the full table width. Use cached tightened
@@ -1840,6 +1860,21 @@ class DoclingDetector:
 
         cells = []
         # Don't skip first row — the grid box typically starts below headers
+        box_w = x2 - x1
+
+        # Pre-compute which columns to keep.  Narrow label/number columns
+        # (< 30% of box width) are dropped only when wider columns exist;
+        # if ALL columns are narrow (e.g. a 4-column equal grid) keep them.
+        col_ranges = [
+            (col_bounds[c], col_bounds[c + 1])
+            for c in range(len(col_bounds) - 1)
+            if col_bounds[c + 1] - col_bounds[c] >= 80
+        ]
+        wide_cols = [
+            (cx1, cx2) for cx1, cx2 in col_ranges
+            if (cx2 - cx1) / max(box_w, 1) >= self._GRID_MIN_COL_WIDTH_FRAC
+        ]
+        keep_cols = wide_cols if wide_cols else col_ranges
 
         for r in range(len(row_bounds) - 1):
             ry1 = row_bounds[r] + self._CELL_INWARD_MARGIN_Y
@@ -1847,11 +1882,7 @@ class DoclingDetector:
             if ry2 - ry1 < 100:
                 continue
 
-            for c in range(len(col_bounds) - 1):
-                cx1 = col_bounds[c]
-                cx2 = col_bounds[c + 1]
-                if cx2 - cx1 < 80:
-                    continue
+            for cx1, cx2 in keep_cols:
 
                 if self._validate_candidate(page_image, cx1, ry1, cx2, ry2):
                     cells.append((cx1, ry1, cx2, ry2))

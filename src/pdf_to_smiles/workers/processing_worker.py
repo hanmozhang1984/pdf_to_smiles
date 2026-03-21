@@ -542,29 +542,33 @@ class ProcessingWorker(QThread):
                                 if struct_idx < len(structure_boxes):
                                     box = structure_boxes[struct_idx]
                                     if box is not None:
-                                        from ..core.vlm_scheme_extractor import (
-                                            is_scheme_crop,
-                                            is_available as _vlm_available,
-                                            extract_final_product_smiles,
-                                        )
-                                        pw, ph = page_image.size
-                                        if is_scheme_crop(box, pw, ph) and _vlm_available():
-                                            logger.info(
-                                                "Page %d struct %d: large crop (%dx%d on %dx%d page), "
-                                                "trying VLM scheme extraction",
-                                                page_num, struct_idx,
-                                                box[2] - box[0], box[3] - box[1], pw, ph,
+                                        try:
+                                            from ..core.vlm_scheme_extractor import (
+                                                is_scheme_crop,
+                                                is_available as _vlm_available,
+                                                extract_final_product_smiles,
                                             )
-                                            vlm_smiles = extract_final_product_smiles(struct_image)
-                                            if vlm_smiles:
-                                                is_valid, canonical, _ = \
-                                                    self._smiles_validator.validate_and_render(vlm_smiles)
-                                                if is_valid:
-                                                    smiles = canonical or vlm_smiles
-                                                    logger.info(
-                                                        "VLM scheme extraction succeeded: %s",
-                                                        smiles[:80],
-                                                    )
+                                        except ImportError:
+                                            is_scheme_crop = None
+                                        if is_scheme_crop is not None:
+                                            pw, ph = page_image.size
+                                            if is_scheme_crop(box, pw, ph) and _vlm_available():
+                                                logger.info(
+                                                    "Page %d struct %d: large crop (%dx%d on %dx%d page), "
+                                                    "trying VLM scheme extraction",
+                                                    page_num, struct_idx,
+                                                    box[2] - box[0], box[3] - box[1], pw, ph,
+                                                )
+                                                vlm_smiles = extract_final_product_smiles(struct_image)
+                                                if vlm_smiles:
+                                                    is_valid, canonical, _ = \
+                                                        self._smiles_validator.validate_and_render(vlm_smiles)
+                                                    if is_valid:
+                                                        smiles = canonical or vlm_smiles
+                                                        logger.info(
+                                                            "VLM scheme extraction succeeded: %s",
+                                                            smiles[:80],
+                                                        )
 
                                 # Regular prediction (skip if VLM already succeeded)
                                 if smiles is None:

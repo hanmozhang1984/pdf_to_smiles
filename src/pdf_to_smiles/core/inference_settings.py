@@ -76,6 +76,7 @@ class InferenceSettings:
         self._classifier_prompt_path: Optional[str] = None
         self._mlx_endpoint: str = "http://localhost:8000"
         self._mlx_model: str = "mlx-community/Qwen3-VL-8B-Instruct-4bit"
+        self._molsight_checkpoint: str = "pubchem_uspto_smiles_edges_30.pth"
         self._load_settings()
 
     @classmethod
@@ -195,6 +196,17 @@ class InferenceSettings:
         self._mlx_model = value
         self._save_settings()
 
+    @property
+    def molsight_checkpoint(self) -> str:
+        """MolSight checkpoint filename."""
+        return self._molsight_checkpoint
+
+    @molsight_checkpoint.setter
+    def molsight_checkpoint(self, value: str) -> None:
+        """Set MolSight checkpoint filename."""
+        self._molsight_checkpoint = value
+        self._save_settings()
+
     def apply_api_keys(self) -> None:
         """Apply stored API keys to environment variables."""
         if self._anthropic_api_key:
@@ -247,6 +259,7 @@ class InferenceSettings:
                     self._classifier_prompt_path = data.get("classifier_prompt_path")
                     self._mlx_endpoint = data.get("mlx_endpoint", "http://localhost:8000")
                     self._mlx_model = data.get("mlx_model", "mlx-community/Qwen3-VL-8B-Instruct-4bit")
+                    self._molsight_checkpoint = data.get("molsight_checkpoint", "pubchem_uspto_smiles_edges_30.pth")
         except Exception:
             pass  # Use defaults if loading fails
 
@@ -264,6 +277,7 @@ class InferenceSettings:
                     "ollama_model": self._ollama_model,
                     "mlx_endpoint": self._mlx_endpoint,
                     "mlx_model": self._mlx_model,
+                    "molsight_checkpoint": self._molsight_checkpoint,
                 }
                 if self._anthropic_api_key:
                     data["anthropic_api_key"] = self._anthropic_api_key

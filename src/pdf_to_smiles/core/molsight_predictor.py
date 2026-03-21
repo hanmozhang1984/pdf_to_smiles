@@ -520,6 +520,13 @@ class MolSightPredictor(SubprocessPredictor):
         """
         molsight_results: list[Optional[str]] = []
 
+        # Step 0: Tighten oversized crops before any prediction attempt.
+        # Patent table cells are often 804×500+ px where the actual structure
+        # occupies ~30-40%. Autocrop to the largest ink region so MolSight
+        # sees just the structure, not table borders and adjacent row bleed.
+        from pdf_to_smiles.core.image_cleaner import autocrop_structure
+        image = autocrop_structure(image)
+
         # Step 1: Raw image — MolSight's internal transforms handle it best
         result = self._postprocess(self.predict_single(image))
         molsight_results.append(result)

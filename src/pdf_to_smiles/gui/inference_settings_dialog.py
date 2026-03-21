@@ -3,7 +3,7 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QRadioButton,
     QLabel, QLineEdit, QPushButton, QDialogButtonBox, QMessageBox,
-    QApplication
+    QApplication, QComboBox
 )
 from PySide6.QtCore import Qt
 
@@ -57,6 +57,21 @@ class InferenceSettingsDialog(QDialog):
             "Best for stereochemistry-heavy structures."
         )
         mode_layout.addWidget(self._radio_molsight)
+
+        # MolSight checkpoint selector
+        self._molsight_settings_widget = QGroupBox()
+        self._molsight_settings_widget.setFlat(True)
+        self._molsight_settings_widget.setStyleSheet(
+            "QGroupBox { border: none; margin-left: 20px; }"
+        )
+        molsight_inner_layout = QHBoxLayout(self._molsight_settings_widget)
+        molsight_inner_layout.addWidget(QLabel("Checkpoint:"))
+        self._combo_molsight_checkpoint = QComboBox()
+        self._combo_molsight_checkpoint.setMinimumWidth(250)
+        self._populate_molsight_checkpoints()
+        molsight_inner_layout.addWidget(self._combo_molsight_checkpoint)
+        molsight_inner_layout.addStretch()
+        mode_layout.addWidget(self._molsight_settings_widget)
 
         self._radio_local_cpu = QRadioButton("Local CPU (DECIMER, slow)")
         self._radio_local_cpu.setToolTip(
@@ -274,6 +289,11 @@ class InferenceSettingsDialog(QDialog):
         if self._settings.cloud_endpoint:
             self._txt_endpoint.setText(self._settings.cloud_endpoint)
 
+        # MolSight checkpoint
+        idx = self._combo_molsight_checkpoint.findText(self._settings.molsight_checkpoint)
+        if idx >= 0:
+            self._combo_molsight_checkpoint.setCurrentIndex(idx)
+
         if self._settings.anthropic_api_key:
             self._txt_api_key.setText(self._settings.anthropic_api_key)
 
@@ -307,11 +327,30 @@ class InferenceSettingsDialog(QDialog):
         self._on_mode_changed()
         self._on_classifier_mode_changed()
 
+    def _populate_molsight_checkpoints(self) -> None:
+        """Scan MolSight directory for .pth checkpoint files."""
+        import os
+        molsight_dir = os.path.join(
+            os.path.expanduser("~"), "Documents", "Projects", "MolSight"
+        )
+        self._combo_molsight_checkpoint.clear()
+        if os.path.isdir(molsight_dir):
+            pth_files = sorted(
+                f for f in os.listdir(molsight_dir) if f.endswith(".pth")
+            )
+            for f in pth_files:
+                self._combo_molsight_checkpoint.addItem(f)
+        # Ensure default is present even if directory doesn't exist
+        if self._combo_molsight_checkpoint.count() == 0:
+            self._combo_molsight_checkpoint.addItem("pubchem_uspto_smiles_edges_30.pth")
+
     def _on_mode_changed(self) -> None:
         """Handle inference mode change."""
         is_cloud = self._radio_cloud.isChecked()
+        is_molsight = self._radio_molsight.isChecked()
         self._txt_endpoint.setEnabled(is_cloud)
         self._btn_test.setEnabled(is_cloud)
+        self._molsight_settings_widget.setVisible(is_molsight)
 
     def _on_classifier_mode_changed(self) -> None:
         """Show/hide classifier-specific settings based on classifier mode."""
@@ -528,6 +567,11 @@ class InferenceSettingsDialog(QDialog):
         mlx_model = self._txt_mlx_model.text().strip()
         if mlx_model:
             self._settings.mlx_model = mlx_model
+
+        # Save MolSight checkpoint
+        checkpoint = self._combo_molsight_checkpoint.currentText()
+        if checkpoint:
+            self._settings.molsight_checkpoint = checkpoint
 
         # Save mode
         self._settings.mode = mode

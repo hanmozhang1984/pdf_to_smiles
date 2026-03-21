@@ -536,10 +536,45 @@ class ProcessingWorker(QThread):
                             )
 
                             try:
-                                # Predict SMILES (uses cloud or local based on settings)
-                                smiles = self._inference_provider.predict_smiles(
-                                    struct_image, high_accuracy=self._high_accuracy_mode
-                                )
+                                smiles = None
+
+                                # For scheme-sized crops, try VLM extraction first
+                                if struct_idx < len(structure_boxes):
+                                    box = structure_boxes[struct_idx]
+                                    if box is not None:
+                                        try:
+                                            from ..core.vlm_scheme_extractor import (
+                                                is_scheme_crop,
+                                                is_available as _vlm_available,
+                                                extract_final_product_smiles,
+                                            )
+                                        except ImportError:
+                                            is_scheme_crop = None
+                                        if is_scheme_crop is not None:
+                                            pw, ph = page_image.size
+                                            if is_scheme_crop(box, pw, ph) and _vlm_available():
+                                                logger.info(
+                                                    "Page %d struct %d: large crop (%dx%d on %dx%d page), "
+                                                    "trying VLM scheme extraction",
+                                                    page_num, struct_idx,
+                                                    box[2] - box[0], box[3] - box[1], pw, ph,
+                                                )
+                                                vlm_smiles = extract_final_product_smiles(struct_image)
+                                                if vlm_smiles:
+                                                    is_valid, canonical, _ = \
+                                                        self._smiles_validator.validate_and_render(vlm_smiles)
+                                                    if is_valid:
+                                                        smiles = canonical or vlm_smiles
+                                                        logger.info(
+                                                            "VLM scheme extraction succeeded: %s",
+                                                            smiles[:80],
+                                                        )
+
+                                # Regular prediction (skip if VLM already succeeded)
+                                if smiles is None:
+                                    smiles = self._inference_provider.predict_smiles(
+                                        struct_image, high_accuracy=self._high_accuracy_mode
+                                    )
                                 result.smiles = smiles
 
                                 if smiles:

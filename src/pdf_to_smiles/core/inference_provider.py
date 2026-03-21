@@ -64,7 +64,8 @@ class InferenceProvider:
         """Get or create MolSight predictor (subprocess in separate venv)."""
         if self._molsight_predictor is None:
             from .molsight_predictor import MolSightPredictor
-            self._molsight_predictor = MolSightPredictor()
+            checkpoint = self._settings.molsight_checkpoint
+            self._molsight_predictor = MolSightPredictor(checkpoint_path=checkpoint)
         return self._molsight_predictor
 
     def _get_cloud_client(self):

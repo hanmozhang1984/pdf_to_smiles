@@ -76,7 +76,7 @@ class InferenceSettings:
         self._classifier_prompt_path: Optional[str] = None
         self._mlx_endpoint: str = "http://localhost:8000"
         self._mlx_model: str = "mlx-community/Qwen3-VL-8B-Instruct-4bit"
-        self._molsight_checkpoint: str = "pubchem_uspto_smiles_edges_30.pth"
+        self._molsight_checkpoint: str = "patent_sft_final.pth"
         self._load_settings()
 
     @classmethod
@@ -259,7 +259,7 @@ class InferenceSettings:
                     self._classifier_prompt_path = data.get("classifier_prompt_path")
                     self._mlx_endpoint = data.get("mlx_endpoint", "http://localhost:8000")
                     self._mlx_model = data.get("mlx_model", "mlx-community/Qwen3-VL-8B-Instruct-4bit")
-                    self._molsight_checkpoint = data.get("molsight_checkpoint", "pubchem_uspto_smiles_edges_30.pth")
+                    self._molsight_checkpoint = data.get("molsight_checkpoint", "patent_sft_final.pth")
         except Exception:
             pass  # Use defaults if loading fails
 

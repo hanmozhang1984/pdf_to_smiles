@@ -80,7 +80,8 @@ class ExportHandler:
             headers = [
                 'Source_File', 'Compound_ID', 'Compound_Type', 'Page', 'Structure', 'SMILES', 'Canonical_SMILES', 'Valid',
                 'MW_Da', 'cLogP', 'TPSA', 'Rotatable_Bonds', 'Stereocenters',
-                'Molecular_Formula', 'Error'
+                'Molecular_Formula', 'Formula_Validation', 'Reference_Formula',
+                'Reference_Mass', 'Mass_Error_ppm', 'Error'
             ]
             # Add dynamic bio data column headers
             headers.extend(sorted_bio_keys)
@@ -107,6 +108,10 @@ class ExportHandler:
                     result.num_rotatable_bonds if result.num_rotatable_bonds is not None else '',
                     result.num_stereocenters if result.num_stereocenters is not None else '',
                     result.molecular_formula or '',
+                    result.formula_validation or '',
+                    result.reference_formula or '',
+                    f"{result.reference_mass:.4f}" if result.reference_mass is not None else '',
+                    f"{result.mass_error_ppm:.1f}" if result.mass_error_ppm is not None else '',
                     result.error_message or ''
                 ]
                 # Add dynamic bio data values
@@ -200,6 +205,13 @@ class ExportHandler:
                         f.write(f"  Rotatable Bonds: {result.num_rotatable_bonds}\n")
                     if result.num_stereocenters is not None:
                         f.write(f"  Stereocenters: {result.num_stereocenters}\n")
+                # Formula validation
+                if result.formula_validation and result.formula_validation != "no_reference":
+                    f.write(f"  Formula Validation: {result.formula_validation}\n")
+                    if result.reference_formula:
+                        f.write(f"  Reference Formula: {result.reference_formula}\n")
+                    if result.mass_error_ppm is not None:
+                        f.write(f"  Mass Error: {result.mass_error_ppm:.1f} ppm\n")
                 # Biological data (dynamic)
                 for bio_key, bio_value in result.bio_data.items():
                     f.write(f"  {bio_key}: {bio_value}\n")
@@ -321,6 +333,16 @@ class ExportHandler:
                     mol.SetProp("Rotatable_Bonds", str(result.num_rotatable_bonds))
                 if result.num_stereocenters is not None:
                     mol.SetProp("Stereocenters", str(result.num_stereocenters))
+
+                # Add formula validation
+                if result.formula_validation:
+                    mol.SetProp("Formula_Validation", result.formula_validation)
+                if result.reference_formula:
+                    mol.SetProp("Reference_Formula", result.reference_formula)
+                if result.reference_mass is not None:
+                    mol.SetProp("Reference_Mass", f"{result.reference_mass:.4f}")
+                if result.mass_error_ppm is not None:
+                    mol.SetProp("Mass_Error_ppm", f"{result.mass_error_ppm:.1f}")
 
                 # Add biological data (dynamic)
                 for bio_key, bio_value in result.bio_data.items():

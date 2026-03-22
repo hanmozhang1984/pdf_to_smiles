@@ -208,7 +208,7 @@ class MainWindow(QMainWindow):
         self._results: List[ExtractionResult] = []
         self._worker: Optional[ProcessingWorker] = None
         self._custom_columns: List[str] = []  # Track custom column names
-        self._base_column_count = 15  # Number of built-in columns (without bio data columns)
+        self._base_column_count = 16  # Number of built-in columns (without bio data columns)
         self._bio_columns: List[str] = []  # Track dynamic bio data column names
         self._custom_column_data: dict = {}  # Store custom column values by (row, col_name)
         self._last_bio_data: dict = {}  # Store last extracted bio data for unmatched display
@@ -468,10 +468,10 @@ class MainWindow(QMainWindow):
 
         # Results table - base columns only (bio data columns added dynamically)
         self._table = QTableWidget()
-        self._table.setColumnCount(15)
+        self._table.setColumnCount(16)
         self._table.setHorizontalHeaderLabels([
             "", "Source", "Compound", "Type", "Page", "Original", "SMILES", "Valid", "RDKit Rendering",
-            "MW (Da)", "cLogP", "TPSA", "Rot. Bonds", "Stereo", "Formula"
+            "MW (Da)", "cLogP", "TPSA", "Rot. Bonds", "Stereo", "Formula", "Validation"
         ])
 
         # Configure table - allow interactive column resizing by mouse drag
@@ -499,7 +499,7 @@ class MainWindow(QMainWindow):
         self._table.setColumnWidth(11, 60)  # TPSA
         self._table.setColumnWidth(12, 80)  # Rot. Bonds
         self._table.setColumnWidth(13, 55)  # Stereo
-        # Column 14 (Formula) stretches to fill remaining space initially
+        self._table.setColumnWidth(15, 90)   # Validation
         # Bio data columns are added dynamically after processing
 
         # Enable row resizing by mouse drag
@@ -736,7 +736,32 @@ class MainWindow(QMainWindow):
         formula_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, 14, formula_item)
 
-        # Add bio data columns (dynamic, starting at column 14)
+        # Formula Validation - column 15
+        validation_status = result.formula_validation
+        if validation_status == "match":
+            val_item = QTableWidgetItem("\u2713 Match")
+            val_item.setBackground(QColor(144, 238, 144))  # Light green
+        elif validation_status == "mass_only_match":
+            val_item = QTableWidgetItem("\u26A0 Mass OK")
+            val_item.setBackground(QColor(255, 255, 150))  # Light yellow
+            if result.mass_error_ppm is not None:
+                val_item.setToolTip(f"Mass error: {result.mass_error_ppm:.1f} ppm")
+        elif validation_status == "mismatch":
+            val_item = QTableWidgetItem("\u2717 Mismatch")
+            val_item.setBackground(QColor(255, 160, 160))  # Light red
+            tooltip_parts = []
+            if result.reference_formula:
+                tooltip_parts.append(f"Expected: {result.reference_formula}")
+            if result.molecular_formula:
+                tooltip_parts.append(f"Computed: {result.molecular_formula}")
+            if tooltip_parts:
+                val_item.setToolTip("\n".join(tooltip_parts))
+        else:
+            val_item = QTableWidgetItem("-")
+        val_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, 15, val_item)
+
+        # Add bio data columns (dynamic, starting at column 16)
         for i, col_name in enumerate(self._bio_columns):
             col_index = self._base_column_count + i
             # Get value from bio_data dict

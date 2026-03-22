@@ -407,11 +407,11 @@ class MolSightPredictor(SubprocessPredictor):
     # Default WORKER_SCRIPT for backward compatibility (used by SubprocessPredictor)
     WORKER_SCRIPT = _WORKER_SCRIPT_TEMPLATE.format(
         molsight_dir=MOLSIGHT_DIR,
-        checkpoint_path="pubchem_uspto_smiles_edges_30.pth",
+        checkpoint_path="patent_sft_final.pth",
         use_lora="False",
     )
 
-    def __init__(self, checkpoint_path: str = "pubchem_uspto_smiles_edges_30.pth"):
+    def __init__(self, checkpoint_path: str = "patent_sft_final.pth"):
         # Determine if this is a LoRA checkpoint (GRPO-trained)
         use_lora = "grpo" in checkpoint_path.lower() or "lora" in checkpoint_path.lower()
         # Set WORKER_SCRIPT before super().__init__() which starts the subprocess

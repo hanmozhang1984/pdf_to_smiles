@@ -203,6 +203,91 @@ def _compare(
     )
 
 
+def correct_compound_ids(
+    structures: List[dict],
+    references: List,
+) -> Dict[int, str]:
+    """Return {structure_index: corrected_compound_id} based on mass matching.
+
+    Computes [M+H]+ for each structure from its SMILES, then matches against
+    reference masses using greedy best-first assignment (lowest mass error
+    first). Only reassigns when a clear mass match exists within tolerance.
+
+    Args:
+        structures: List of dicts with at least "index" (int) and "smiles" (str|None).
+        references: List of FormulaReference objects from the same page.
+
+    Returns:
+        Dict mapping structure index to corrected compound_id. Structures
+        without a match are not included.
+    """
+    # Compute [M+H]+ for each structure
+    struct_masses = {}  # index -> computed [M+H]+
+    for s in structures:
+        smiles = s.get("canonical_smiles") or s.get("smiles")
+        if not smiles:
+            continue
+        _, mass = _compute_from_smiles(smiles)
+        if mass is not None:
+            struct_masses[s["index"]] = mass + _PROTON_MASS
+
+    if not struct_masses:
+        return {}
+
+    # Filter references to those with both compound_id and expected_mh_mass
+    valid_refs = [
+        r for r in references
+        if r.compound_id and r.expected_mh_mass is not None
+    ]
+    if not valid_refs:
+        return {}
+
+    # Build all (struct_index, ref_index, mass_error) pairs
+    pairs = []
+    for s_idx, computed_mh in struct_masses.items():
+        for r_idx, ref in enumerate(valid_refs):
+            error = abs(computed_mh - ref.expected_mh_mass)
+            pairs.append((error, s_idx, r_idx))
+
+    # Sort by mass error (best matches first)
+    pairs.sort()
+
+    # Greedy assignment: assign best matches first, skip if either already assigned
+    assigned_structs = set()
+    assigned_refs = set()
+    corrections = {}
+
+    for error, s_idx, r_idx in pairs:
+        if s_idx in assigned_structs or r_idx in assigned_refs:
+            continue
+
+        ref = valid_refs[r_idx]
+        computed_mh = struct_masses[s_idx]
+
+        # Check tolerance: 0.5 Da for integer masses, 10 ppm for precise
+        is_integer_mass = ref.expected_mh_mass == int(ref.expected_mh_mass)
+        if is_integer_mass:
+            if error > 0.5:
+                continue
+        else:
+            ppm = abs((computed_mh - ref.expected_mh_mass) / ref.expected_mh_mass) * 1e6
+            if ppm > 10.0:
+                continue
+
+        corrections[s_idx] = ref.compound_id
+        assigned_structs.add(s_idx)
+        assigned_refs.add(r_idx)
+
+    if corrections:
+        logger.info(
+            "Mass-based ID correction: reassigned %d structure(s): %s",
+            len(corrections),
+            {idx: cid for idx, cid in corrections.items()},
+        )
+
+    return corrections
+
+
 def _ppm_error(computed: float, reference: float) -> float:
     """Calculate mass error in parts per million."""
     if reference == 0:

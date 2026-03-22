@@ -20,7 +20,7 @@ from ..core.biological_data_extractor import BiologicalDataExtractor
 from ..core.inference_settings import InferenceSettings, InferenceMode
 from ..core.inference_provider import InferenceProvider
 from ..core.formula_extractor import FormulaExtractor
-from ..core.formula_validator import FormulaValidator
+from ..core.formula_validator import FormulaValidator, correct_compound_ids
 
 # Try to import pytesseract for OCR-based compound number detection
 try:
@@ -522,7 +522,8 @@ class ProcessingWorker(QThread):
                         else:
                             next_compound_id += total_structures
 
-                        # Process each detected structure
+                        # Pass 1: Process each detected structure (SMILES prediction + properties)
+                        page_results = []  # collect results for this page
                         for struct_idx, struct_image in enumerate(structures):
                             if self._is_cancelled():
                                 break
@@ -551,8 +552,7 @@ class ProcessingWorker(QThread):
                                 result.compound_id = example_heading_id
 
                             if classification_results and result.compound_type == "other":
-                                results.append(result)
-                                self.result_ready.emit(result)
+                                page_results.append(result)
                                 continue
 
                             self._emit_progress(
@@ -621,23 +621,51 @@ class ProcessingWorker(QThread):
                                         result.tpsa = props['tpsa']
                                         result.num_rotatable_bonds = props['num_rotatable_bonds']
                                         result.num_stereocenters = props['num_stereocenters']
-
-                                        # Validate formula against patent analytical data
-                                        if page_formulas and self._formula_validator:
-                                            validation = self._formula_validator.validate(
-                                                canonical or smiles,
-                                                page_formulas,
-                                                compound_id=result.compound_id,
-                                            )
-                                            result.reference_formula = validation.reference_formula
-                                            result.formula_validation = validation.status
-                                            result.reference_mass = validation.reference_mass
-                                            result.mass_error_ppm = validation.mass_error_ppm
                                 else:
                                     result.error_message = "SMILES prediction failed"
 
                             except Exception as e:
                                 result.error_message = str(e)
+
+                            page_results.append(result)
+
+                        # Correction step: reassign compound IDs based on mass matching
+                        if page_formulas and page_results:
+                            struct_data = [
+                                {
+                                    "index": r.structure_index,
+                                    "smiles": r.smiles,
+                                    "canonical_smiles": r.canonical_smiles,
+                                }
+                                for r in page_results
+                            ]
+                            id_corrections = correct_compound_ids(struct_data, page_formulas)
+                            for r in page_results:
+                                if r.structure_index in id_corrections:
+                                    old_id = r.compound_id
+                                    r.compound_id = id_corrections[r.structure_index]
+                                    logger.info(
+                                        "Page %d struct %d: corrected ID %s -> %s",
+                                        page_num, r.structure_index, old_id, r.compound_id,
+                                    )
+
+                        # Pass 2: Formula validation with corrected IDs
+                        for result in page_results:
+                            if (
+                                page_formulas
+                                and self._formula_validator
+                                and result.is_valid
+                                and result.canonical_smiles
+                            ):
+                                validation = self._formula_validator.validate(
+                                    result.canonical_smiles,
+                                    page_formulas,
+                                    compound_id=result.compound_id,
+                                )
+                                result.reference_formula = validation.reference_formula
+                                result.formula_validation = validation.status
+                                result.reference_mass = validation.reference_mass
+                                result.mass_error_ppm = validation.mass_error_ppm
 
                             results.append(result)
                             self.result_ready.emit(result)

@@ -34,7 +34,7 @@ from pdf_to_smiles.core.formula_extractor import (
     _parse_response,
     _resize_for_api,
 )
-from pdf_to_smiles.core.formula_validator import FormulaValidator
+from pdf_to_smiles.core.formula_validator import FormulaValidator, correct_compound_ids
 from pdf_to_smiles.core.inference_provider import InferenceProvider
 from pdf_to_smiles.core.mlx_compound_classifier import MLXVLMCompoundClassifier
 from pdf_to_smiles.core.smiles_validator import SMILESValidator
@@ -264,14 +264,11 @@ def process_page(
         print(f"    Skipping formula extraction (--no-formula)")
     result["formula_refs"] = formula_refs
 
-    # 4. Per-structure: predict SMILES, validate, check formula
-    labels = []
+    # 4. Per-structure: predict SMILES, compute properties (no formula validation yet)
     for i, (crop, box) in enumerate(zip(crops, boxes)):
         cls = classifications[i] if i < len(classifications) else {"type": "other", "id": None}
         compound_id = cls.get("id")
         compound_type = cls.get("type", "other")
-        label = compound_id or f"#{i}"
-        labels.append(label)
 
         struct_result = {
             "index": i,
@@ -288,6 +285,7 @@ def process_page(
         }
 
         # Predict SMILES
+        label = compound_id or f"#{i}"
         print(f"    [{i}] Predicting SMILES for {label}...")
         try:
             smiles = inference.predict_smiles(crop)
@@ -307,19 +305,30 @@ def process_page(
                 props = smiles_validator.get_all_properties(canonical)
                 struct_result["properties"] = props
 
-                # Formula validation
-                if formula_refs:
-                    try:
-                        fv_result = formula_validator.validate(
-                            canonical, formula_refs, compound_id=compound_id
-                        )
-                        struct_result["formula_validation"] = fv_result
-                    except Exception as e:
-                        print(f"    [{i}] Formula validation failed: {e}")
-
         result["structures"].append(struct_result)
 
-    # 5. Annotate page image
+    # 5. Correct compound IDs via mass matching
+    if formula_refs and result["structures"]:
+        id_corrections = correct_compound_ids(result["structures"], formula_refs)
+        for s in result["structures"]:
+            if s["index"] in id_corrections:
+                old_id = s["compound_id"]
+                s["compound_id"] = id_corrections[s["index"]]
+                print(f"    [{s['index']}] ID corrected: {old_id} -> {s['compound_id']}")
+
+    # 6. Formula validation with corrected IDs
+    for s in result["structures"]:
+        if s["smiles_valid"] and s["canonical_smiles"] and formula_refs:
+            try:
+                fv_result = formula_validator.validate(
+                    s["canonical_smiles"], formula_refs, compound_id=s["compound_id"]
+                )
+                s["formula_validation"] = fv_result
+            except Exception as e:
+                print(f"    [{s['index']}] Formula validation failed: {e}")
+
+    # 7. Annotate page image with corrected labels
+    labels = [s["compound_id"] or f"#{s['index']}" for s in result["structures"]]
     result["annotated_image"] = annotate_page_image(page_image, boxes, labels)
 
     return result

@@ -19,6 +19,8 @@ from ..core.compound_detector import CompoundDetector
 from ..core.biological_data_extractor import BiologicalDataExtractor
 from ..core.inference_settings import InferenceSettings, InferenceMode
 from ..core.inference_provider import InferenceProvider
+from ..core.formula_extractor import FormulaExtractor
+from ..core.formula_validator import FormulaValidator
 
 # Try to import pytesseract for OCR-based compound number detection
 try:
@@ -125,6 +127,10 @@ class ProcessingWorker(QThread):
         # Store extracted bio data for access after processing
         # Format: {source_file: {compound_id: BiologicalData}}
         self._extracted_bio_data: dict = {}
+
+        # Formula validation (lazy-initialized)
+        self._formula_extractor: Optional[FormulaExtractor] = None
+        self._formula_validator: Optional[FormulaValidator] = None
 
     def set_pdf_path(self, path: str) -> None:
         """Set a single PDF file path to process (legacy support).
@@ -464,6 +470,25 @@ class ProcessingWorker(QThread):
                             last_example_heading_id = heading
                         example_heading_id = last_example_heading_id
 
+                        # Extract reference formulas from page (Claude Vision)
+                        page_formulas = []
+                        if self._inference_settings.anthropic_api_key:
+                            try:
+                                if self._formula_extractor is None:
+                                    self._formula_extractor = FormulaExtractor(
+                                        api_key=self._inference_settings.anthropic_api_key
+                                    )
+                                if self._formula_validator is None:
+                                    self._formula_validator = FormulaValidator()
+                                page_formulas = self._formula_extractor.extract_from_page(
+                                    page_image, page_num
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    "Formula extraction failed for page %d: %s",
+                                    page_num, e,
+                                )
+
                         # Detect example numbers from page using OCR
                         compound_results = self._detect_example_numbers_from_page(
                             page_image, structures, next_compound_id,
@@ -596,6 +621,18 @@ class ProcessingWorker(QThread):
                                         result.tpsa = props['tpsa']
                                         result.num_rotatable_bonds = props['num_rotatable_bonds']
                                         result.num_stereocenters = props['num_stereocenters']
+
+                                        # Validate formula against patent analytical data
+                                        if page_formulas and self._formula_validator:
+                                            validation = self._formula_validator.validate(
+                                                canonical or smiles,
+                                                page_formulas,
+                                                compound_id=result.compound_id,
+                                            )
+                                            result.reference_formula = validation.reference_formula
+                                            result.formula_validation = validation.status
+                                            result.reference_mass = validation.reference_mass
+                                            result.mass_error_ppm = validation.mass_error_ppm
                                 else:
                                     result.error_message = "SMILES prediction failed"
 

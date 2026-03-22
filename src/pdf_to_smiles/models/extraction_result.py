@@ -60,6 +60,11 @@ class ExtractionResult:
     kd: Optional[str] = None
     # Dynamic biological data (assay_name -> value) for any assay type
     bio_data: Dict[str, str] = field(default_factory=dict)
+    # Formula validation (from patent analytical data)
+    reference_formula: Optional[str] = None
+    formula_validation: Optional[str] = None  # "match", "mismatch", "mass_only_match", "no_reference"
+    reference_mass: Optional[float] = None
+    mass_error_ppm: Optional[float] = None
 
     @property
     def display_smiles(self) -> str:

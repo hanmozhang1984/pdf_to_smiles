@@ -329,8 +329,12 @@ class MolSightPredictor(SubprocessPredictor):
         ckpt_path = "{checkpoint_path}"
         if not os.path.exists(ckpt_path):
             import urllib.request
-            url = "https://huggingface.co/Robert-zwr/MolSight/resolve/main/pubchem_uspto_smiles_edges_30.pth?download=true"
-            print(f"Downloading MolSight weights...", file=sys.stderr, flush=True)
+            if ckpt_path == "patent_sft_final.pth":
+                url = "https://huggingface.co/hanmozhang1984/MolSight-patent-finetuned/resolve/main/patent_sft_final.pth?download=true"
+                print(f"Downloading fine-tuned MolSight weights from HuggingFace...", file=sys.stderr, flush=True)
+            else:
+                url = "https://huggingface.co/Robert-zwr/MolSight/resolve/main/pubchem_uspto_smiles_edges_30.pth?download=true"
+                print(f"WARNING: Fine-tuned checkpoint not found, downloading base MolSight weights...", file=sys.stderr, flush=True)
             urllib.request.urlretrieve(url, ckpt_path)
 
         checkpoint = torch.load(ckpt_path, map_location="cpu")

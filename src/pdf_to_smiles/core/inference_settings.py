@@ -77,6 +77,10 @@ class InferenceSettings:
         self._mlx_endpoint: str = "http://localhost:8000"
         self._mlx_model: str = "mlx-community/Qwen3-VL-8B-Instruct-4bit"
         self._molsight_checkpoint: str = "patent_sft_final.pth"
+        # Hybrid confidence routing settings
+        self._hybrid_fallback: bool = False  # Enable API fallback on low confidence
+        self._confidence_threshold: float = -0.012  # avg_logprob below this triggers fallback
+        self._hybrid_vision_model: str = "claude-sonnet-4-20250514"
         self._load_settings()
 
     @classmethod
@@ -207,6 +211,39 @@ class InferenceSettings:
         self._molsight_checkpoint = value
         self._save_settings()
 
+    @property
+    def hybrid_fallback(self) -> bool:
+        """Whether to enable Claude Vision API fallback on low confidence."""
+        return self._hybrid_fallback
+
+    @hybrid_fallback.setter
+    def hybrid_fallback(self, value: bool) -> None:
+        """Enable/disable hybrid API fallback."""
+        self._hybrid_fallback = value
+        self._save_settings()
+
+    @property
+    def confidence_threshold(self) -> float:
+        """avg_logprob threshold below which API fallback is triggered."""
+        return self._confidence_threshold
+
+    @confidence_threshold.setter
+    def confidence_threshold(self, value: float) -> None:
+        """Set confidence threshold for hybrid routing."""
+        self._confidence_threshold = value
+        self._save_settings()
+
+    @property
+    def hybrid_vision_model(self) -> str:
+        """Claude model used for hybrid vision fallback."""
+        return self._hybrid_vision_model
+
+    @hybrid_vision_model.setter
+    def hybrid_vision_model(self, value: str) -> None:
+        """Set hybrid vision model."""
+        self._hybrid_vision_model = value
+        self._save_settings()
+
     def apply_api_keys(self) -> None:
         """Apply stored API keys to environment variables."""
         if self._anthropic_api_key:
@@ -260,6 +297,9 @@ class InferenceSettings:
                     self._mlx_endpoint = data.get("mlx_endpoint", "http://localhost:8000")
                     self._mlx_model = data.get("mlx_model", "mlx-community/Qwen3-VL-8B-Instruct-4bit")
                     self._molsight_checkpoint = data.get("molsight_checkpoint", "patent_sft_final.pth")
+                    self._hybrid_fallback = data.get("hybrid_fallback", False)
+                    self._confidence_threshold = data.get("confidence_threshold", -0.4)
+                    self._hybrid_vision_model = data.get("hybrid_vision_model", "claude-sonnet-4-20250514")
         except Exception:
             pass  # Use defaults if loading fails
 
@@ -278,6 +318,9 @@ class InferenceSettings:
                     "mlx_endpoint": self._mlx_endpoint,
                     "mlx_model": self._mlx_model,
                     "molsight_checkpoint": self._molsight_checkpoint,
+                    "hybrid_fallback": self._hybrid_fallback,
+                    "confidence_threshold": self._confidence_threshold,
+                    "hybrid_vision_model": self._hybrid_vision_model,
                 }
                 if self._anthropic_api_key:
                     data["anthropic_api_key"] = self._anthropic_api_key

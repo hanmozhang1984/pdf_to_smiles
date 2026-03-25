@@ -19,7 +19,7 @@ import logging
 import os
 import re
 import textwrap
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from PIL import Image
 
@@ -391,6 +391,7 @@ class MolSightPredictor(SubprocessPredictor):
                         batch_preds["edges"] = edge_preds
 
                 raw_smiles = batch_preds["smiles"][0]
+                avg_logprob = batch_preds["avg_logprob"][0]
                 smiles, _, success = _postprocess_smiles(raw_smiles)
 
                 if Chem is not None:
@@ -400,7 +401,7 @@ class MolSightPredictor(SubprocessPredictor):
                         pass
 
                 if smiles and len(smiles.strip()) > 0:
-                    print(smiles.strip(), flush=True)
+                    print(f"{{smiles.strip()}}\\t{{avg_logprob:.6f}}", flush=True)
                 else:
                     print("NONE", flush=True)
             except Exception as e:
@@ -415,7 +416,14 @@ class MolSightPredictor(SubprocessPredictor):
         use_lora="False",
     )
 
-    def __init__(self, checkpoint_path: str = "patent_sft_final.pth"):
+    def __init__(
+        self,
+        checkpoint_path: str = "patent_sft_final.pth",
+        confidence_threshold: float = -0.012,
+        hybrid_fallback: bool = False,
+        vision_model: str = "claude-sonnet-4-20250514",
+        api_key: Optional[str] = None,
+    ):
         # Determine if this is a LoRA checkpoint (GRPO-trained)
         use_lora = "grpo" in checkpoint_path.lower() or "lora" in checkpoint_path.lower()
         # Set WORKER_SCRIPT before super().__init__() which starts the subprocess
@@ -426,6 +434,11 @@ class MolSightPredictor(SubprocessPredictor):
         )
         super().__init__()
         self._molscribe_fallback = None
+        self._claude_fallback = None
+        self._confidence_threshold = confidence_threshold
+        self._hybrid_fallback = hybrid_fallback
+        self._vision_model = vision_model
+        self._api_key = api_key
         # Check if text masking is available
         try:
             from pdf_to_smiles.core.text_masker import is_available as _text_masker_available
@@ -433,12 +446,66 @@ class MolSightPredictor(SubprocessPredictor):
         except Exception:
             self._mask_text = False
 
+    def predict_single_with_confidence(self, image: Image.Image) -> Tuple[Optional[str], float]:
+        """Predict SMILES and return (smiles, avg_logprob) confidence score.
+
+        The worker subprocess outputs 'SMILES\\tavg_logprob'. This method
+        parses both parts. Returns (None, -inf) on failure.
+        """
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".png", prefix="pred_")
+        os.close(fd)
+        try:
+            image.save(path)
+            with self._lock:
+                self._ensure_running()
+                self._process.stdin.write(path + "\n")
+                self._process.stdin.flush()
+                result = self._readline_with_timeout(120)
+            if result is None or result == "NONE" or not result:
+                return None, float('-inf')
+            # Parse SMILES\tconfidence format
+            if '\t' in result:
+                parts = result.split('\t', 1)
+                smiles = parts[0]
+                try:
+                    confidence = float(parts[1])
+                except (ValueError, IndexError):
+                    confidence = float('-inf')
+                return smiles if smiles else None, confidence
+            # Fallback: no tab means old format (no confidence)
+            return result, float('-inf')
+        except (BrokenPipeError, OSError) as e:
+            logger.warning("Subprocess crashed, will restart: %s", e)
+            self._process = None
+            return None, float('-inf')
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def predict_single(self, image: Image.Image) -> Optional[str]:
+        """Predict SMILES from image (discards confidence)."""
+        smiles, _ = self.predict_single_with_confidence(image)
+        return smiles
+
     def _get_molscribe_fallback(self):
         """Lazy-load MolScribe as fallback predictor."""
         if self._molscribe_fallback is None:
             from .lightweight_predictor import LightweightPredictor
             self._molscribe_fallback = LightweightPredictor()
         return self._molscribe_fallback
+
+    def _get_claude_fallback(self):
+        """Lazy-load Claude Vision API predictor."""
+        if self._claude_fallback is None:
+            from .claude_vision_predictor import ClaudeVisionPredictor
+            self._claude_fallback = ClaudeVisionPredictor(
+                api_key=self._api_key,
+                model=self._vision_model,
+            )
+        return self._claude_fallback
 
     def _preprocess(self, image: Image.Image) -> Image.Image:
         """Apply image cleaning + text masking before MolSight prediction."""
@@ -518,44 +585,90 @@ class MolSightPredictor(SubprocessPredictor):
         2. Cleaned image (contaminant removal + text mask) → MolSight
         3. CLAHE-enhanced cleaned image → MolSight
         4. If all MolSight attempts failed → MolScribe fallback
+        5. If hybrid_fallback enabled and best confidence < threshold → Claude Vision API
 
         At each step, apply SCF3 + deuterium post-processing and prefer
         connected SMILES.
         """
-        molsight_results: list[Optional[str]] = []
+        smiles, confidence = self.predict_with_confidence(image, high_accuracy=high_accuracy)
+
+        # Confidence-based API fallback
+        if (
+            self._hybrid_fallback
+            and confidence < self._confidence_threshold
+            and smiles is not None
+        ):
+            try:
+                api = self._get_claude_fallback()
+                api_result = api.predict(image)
+                if api_result and _is_valid_smiles(api_result):
+                    logger.info(
+                        "Claude Vision fallback used (confidence=%.3f < %.3f): %s → %s",
+                        confidence, self._confidence_threshold,
+                        (smiles or "NONE")[:40], api_result[:40],
+                    )
+                    return api_result
+            except Exception as e:
+                logger.warning("Claude Vision fallback failed: %s", e)
+
+        return smiles
+
+    def predict_with_confidence(
+        self,
+        image: Image.Image,
+        high_accuracy: bool = False,
+    ) -> Tuple[Optional[str], float]:
+        """Predict SMILES with full pipeline, returning (smiles, best_confidence).
+
+        Same multi-variant pipeline as predict(), but returns the confidence
+        score of the best result for downstream routing decisions.
+        """
+        molsight_results: list[Tuple[Optional[str], float]] = []
 
         # Step 0: Tighten oversized crops before any prediction attempt.
-        # Patent table cells are often 804×500+ px where the actual structure
-        # occupies ~30-40%. Autocrop to the largest ink region so MolSight
-        # sees just the structure, not table borders and adjacent row bleed.
         from pdf_to_smiles.core.image_cleaner import autocrop_structure
         image = autocrop_structure(image)
 
         # Step 1: Raw image — MolSight's internal transforms handle it best
-        result = self._postprocess(self.predict_single(image))
-        molsight_results.append(result)
+        raw_smiles, raw_conf = self.predict_single_with_confidence(image)
+        result = self._postprocess(raw_smiles)
+        molsight_results.append((result, raw_conf))
 
         # Early return if we got a valid connected SMILES
         if result and _is_valid_smiles(result) and '.' not in result:
-            return result
+            return result, raw_conf
 
         # Step 2: Cleaned image (remove bleeding lines, mask text)
         cleaned = self._preprocess(image)
-        result = self._postprocess(self.predict_single(cleaned))
-        molsight_results.append(result)
+        raw_smiles, raw_conf = self.predict_single_with_confidence(cleaned)
+        result = self._postprocess(raw_smiles)
+        molsight_results.append((result, raw_conf))
 
         if result and _is_valid_smiles(result) and '.' not in result:
-            return result
+            return result, raw_conf
 
         # Step 3: CLAHE enhancement on cleaned image
         enhanced = self._enhance_image(cleaned, aggressive=False)
-        result = self._postprocess(self.predict_single(enhanced))
-        molsight_results.append(result)
+        raw_smiles, raw_conf = self.predict_single_with_confidence(enhanced)
+        result = self._postprocess(raw_smiles)
+        molsight_results.append((result, raw_conf))
 
-        # Check if any MolSight variant gave a usable result
-        best = self._best_result(*molsight_results)
-        if best is not None:
-            return best
+        # Check if any MolSight variant gave a usable result — pick highest confidence
+        best_smiles = None
+        best_conf = float('-inf')
+        for smi, conf in molsight_results:
+            if _is_valid_smiles(smi) and conf > best_conf:
+                best_smiles = smi
+                best_conf = conf
+
+        # Also consider connected vs disconnected preference
+        best_from_results = self._best_result(*(s for s, _ in molsight_results))
+        if best_from_results is not None:
+            # Use confidence from the matching result
+            for smi, conf in molsight_results:
+                if smi == best_from_results or self._postprocess(smi) == best_from_results:
+                    best_conf = max(best_conf, conf)
+            return best_from_results, best_conf
 
         # Step 4: MolScribe fallback — only if ALL MolSight variants failed
         try:
@@ -563,11 +676,12 @@ class MolSightPredictor(SubprocessPredictor):
             result = fallback.predict(image, high_accuracy=high_accuracy)
             if result:
                 logger.info("MolScribe fallback succeeded where MolSight failed")
-                return result
+                # MolScribe doesn't provide confidence — use -inf to signal unknown
+                return result, float('-inf')
         except Exception as e:
             logger.warning("MolScribe fallback failed: %s", e)
 
-        return None
+        return None, float('-inf')
 
     def predict_batch(
         self,
@@ -583,3 +697,4 @@ class MolSightPredictor(SubprocessPredictor):
     def close(self) -> None:
         super().close()
         self._molscribe_fallback = None
+        self._claude_fallback = None

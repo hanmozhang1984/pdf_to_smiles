@@ -61,11 +61,21 @@ class InferenceProvider:
         return self._lightweight_predictor
 
     def _get_molsight_predictor(self):
-        """Get or create MolSight predictor (subprocess in separate venv)."""
+        """Get or create MolSight predictor (subprocess in separate venv).
+
+        When hybrid_fallback is enabled in settings, the predictor is
+        configured with confidence-based routing to Claude Vision API.
+        """
         if self._molsight_predictor is None:
             from .molsight_predictor import MolSightPredictor
             checkpoint = self._settings.molsight_checkpoint
-            self._molsight_predictor = MolSightPredictor(checkpoint_path=checkpoint)
+            self._molsight_predictor = MolSightPredictor(
+                checkpoint_path=checkpoint,
+                confidence_threshold=self._settings.confidence_threshold,
+                hybrid_fallback=self._settings.hybrid_fallback,
+                vision_model=self._settings.hybrid_vision_model,
+                api_key=self._settings.anthropic_api_key,
+            )
         return self._molsight_predictor
 
     def _get_cloud_client(self):
